@@ -1,0 +1,16 @@
+# WorkBuddy project data
+.workbuddy/
+
+# Sample engineering documents (not part of the skill)
+*.pdf
+*.docx
+*.doc
+*.xls
+*.xlsx
+
+# Packaged skill artifact
+*.zip
+
+# Python cache
+__pycache__/
+*.pyc

@@ -1,0 +1,90 @@
+---
+name: pdf-word-text-replacer
+description: 批量把 PDF 或 Word 文件转成可编辑 Word、按规则查找替换文字，再把结果另存到桌面时间戳新文件夹。当用户给出一个文件夹/一批 PDF/一批 Word 文件，要求先转 Word（针对 PDF）、再把某些文本替换成另一些文本、并另存输出到桌面时使用本技能。触发词：PDF转Word替换、批量替换Word文字、把文件夹里的PDF/Word文字替换后另存、查找替换后输出到桌面。
+agent_created: true
+---
+
+# PDF/Word 批量转换与文字替换
+
+## 概述
+
+处理一批混合的 PDF / Word 文件：PDF 先静默转成可编辑 Word，然后所有 Word 文档按用户给定规则做查找替换，结果统一另存到桌面上一个以日期时间戳命名的新文件夹。替换覆盖正文、页眉、页脚、表格、文本框，保留原格式。
+
+## 何时使用
+
+- 用户给出一个文件夹、一批 PDF 文件、或一批 Word 文件（`.pdf` / `.docx` / `.doc` 混合也可）。
+- 用户要求：PDF 先转 Word，然后把某些文本替换成另一文本，再另存输出。
+- 用户要求输出到桌面新文件夹（按时间戳命名）。
+
+## 前置条件
+
+- 本机已安装 **Adobe Acrobat Pro**（非 Reader）和 **Microsoft Word**。
+- Python 已安装 `pywin32`（`import win32com.client`）。缺失时：`python -m pip install pywin32`。
+- 转换依赖 `scripts/acrobat_export.ps1`（Acrobat IAC 静默导出，无需鼠标、无对话框）。
+
+## 工作流
+
+### 第 1 步：明确替换规则
+
+向用户确认要替换的文本对。用户可能一次给多组。整理成规则数组，每组：
+
+```json
+{"find": "原文", "replace": "新文"}
+```
+
+可选字段：`match_case`（区分大小写）、`whole_word`（全字匹配）、`wildcards`（通配符），默认 `false`。
+
+### 第 2 步：写规则文件（关键，勿跳过）
+
+**必须把规则写成 UTF-8 的 `.json 文件`**，再用 `--rules <文件路径>` 传给脚本。
+
+不要在命令行里直接把中文 JSON 当参数传——PowerShell 5.1 传给 Python 时会破坏中文编码，导致 `JSONDecodeError`。
+
+规则文件格式：
+
+```json
+[
+  {"find": "甲方", "replace": "建设单位"},
+  {"find": "乙方", "replace": "施工单位"}
+]
+```
+
+把文件写到临时目录（如 `%TEMP%\replace_rules.json`），用 Write 工具写 UTF-8。
+
+### 第 3 步：运行主脚本
+
+用 PowerShell 调用（Windows 环境）：
+
+```powershell
+python "<skill_dir>\scripts\batch_replace.py" `
+  --input "<路径1>" "<路径2>" ... `
+  --rules "<规则json文件路径>"
+```
+
+`--input` 接受：单个文件、多个文件、文件夹（递归扫描子目录）、通配符，可混合。
+
+可选参数：
+- `--out-dir <路径>`：自定义输出目录（默认：桌面 `Word替换_YYYYMMDD_HHMMSS` 文件夹）。
+- `--no-convert-pdf`：跳过 PDF 转换（只处理 Word 文件）。
+
+脚本输出以 `|` 分隔的日志行：`RULES` / `INPUTS` / `OUTDIR` / `CONVERT_OK` / `CONVERT_FAIL` / `REPLACE_OK` / `REPLACE_FAIL` / `DONE`。
+
+### 第 4 步：核对与交付
+
+1. 检查日志里的 `DONE|N|输出目录`，确认处理数量与预期一致。
+2. 抽查替换效果：用 Word COM 打开输出文档读 `Content.Text`，确认新文本存在、旧文本归零；页眉页脚也要查（`Sections(1).Headers(1).Range.Text`）。
+3. 用 `present_files` 展示输出文件夹里的 docx。
+4. 告知用户输出目录路径和处理文件数。
+
+## 实现细节（供维护参考）
+
+- **PDF→Word**：`batch_replace.py` 调用 `acrobat_export.ps1`，通过 `[System.__ComObject]::InvokeMember('saveAs', ...)` 走 Acrobat JS 桥接，静默导出 docx（与 GUI「导出到 Word」同一引擎）。中间 docx 落在临时目录，处理完自动清理。
+- **文字替换**：用 `DispatchEx` 创建**独立** Word 实例，遍历 `doc.StoryRanges` 及 `NextStoryRange`（覆盖正文/页眉/页脚/文本框/脚注），对每个 story 执行 `Find.Execute` 的 wdReplaceAll。只关闭本次自己打开的文档，并只 Quit 这个自己创建的实例；用户已打开的 Word 绝不受影响。
+- **踩坑**：`Find.Execute` 在 win32com 下必须用**完整位置参数**（11 个），只传命名参数 `Replace=2` 会静默不生效。脚本已按位置参数写好，勿改回命名参数。
+- **编码**：规则必须走 JSON 文件，不要命令行内联中文。
+- **同名文件**：输出文件名冲突时自动追加 `_1`、`_2`。
+
+## 资源
+
+- `scripts/batch_replace.py`：主脚本（收集输入→PDF转换→Word替换→输出）。
+- `scripts/acrobat_export.ps1`：Acrobat 静默转 Word 脚本（被主脚本调用）。

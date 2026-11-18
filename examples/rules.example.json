@@ -1,0 +1,5 @@
+[
+  { "find": "甲方", "replace": "建设单位" },
+  { "find": "乙方", "replace": "施工单位" },
+  { "find": "NC26E444", "replace": "NC99XXXX" }
+]
