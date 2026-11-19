@@ -19,5 +19,6 @@ __pycache__/
 dist/
 build/
 
-# WeChat OCR binary package (65MB, distributed via team share; wcocr.pyd is kept)
+# WeChat OCR binary package (obsolete; replaced by RapidOCR)
 vendor/WeChatOCR/
+vendor/_old_WeChatOCR_unused/
