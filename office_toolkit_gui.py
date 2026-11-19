@@ -7,7 +7,9 @@ can never be pushed off-screen. The user never touches a command line.
 """
 import os
 import sys
+import json
 import queue
+import subprocess
 import threading
 import traceback
 import tkinter as tk
@@ -276,7 +278,6 @@ class App(tk.Tk):
             return
 
         idx = self.pages.index(page)
-        task = self.tasks[idx]
         files, rules = list(page.files), (list(page.rules) if page.with_rules else None)
 
         self.push_log(f"开始处理 {len(files)} 个文件 → {outdir}")
@@ -285,19 +286,47 @@ class App(tk.Tk):
         self.start_btn.configure(state="disabled", text="处理中…")
         self.progress.start(12)
 
-        def worker(q, task, files, rules, outdir):
-            def op_log(m):
-                q.put(("log", str(m)))
+        if page is self.ocr:
+            # WeChat OCR is a C extension that holds the GIL for seconds at a
+            # time; running it in a thread freezes the GUI. Run it in a
+            # separate process and poll a small JSON status file instead.
+            import json
+            task_file = os.path.join(os.environ.get("TEMP", "C:\\Temp"),
+                                     "ot_ocr_task.json")
+            payload = {"files": files, "outdir": outdir, "logs": [], "done": False}
+            with open(task_file, "w", encoding="utf-8") as fh:
+                json.dump(payload, fh, ensure_ascii=False)
             try:
-                task(files, rules, outdir, op_log)
-            except Exception:
-                q.put(("log", "异常：\n" + traceback.format_exc()))
-            finally:
-                q.put(("done", None))
+                flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+                # In the frozen EXE, sys.executable IS the app. From source,
+                # it is python.exe, so pass this script path explicitly.
+                if getattr(sys, "frozen", False):
+                    cmd = [sys.executable, "--ocr-worker", task_file]
+                else:
+                    cmd = [sys.executable, os.path.abspath(__file__),
+                           "--ocr-worker", task_file]
+                subprocess.Popen(cmd, creationflags=flags)
+            except Exception as e:
+                self.push_log("无法启动 OCR 进程：" + str(e))
+                self.q.put(("done", None))
+            self._ocr_task_file = task_file
+            self._ocr_log_pos = 0
+        else:
+            task = self.tasks[idx]
 
-        threading.Thread(target=worker,
-                         args=(self.q, task, files, rules, outdir),
-                         daemon=True).start()
+            def worker(q, task, files, rules, outdir):
+                def op_log(m):
+                    q.put(("log", str(m)))
+                try:
+                    task(files, rules, outdir, op_log)
+                except Exception:
+                    q.put(("log", "异常：\n" + traceback.format_exc()))
+                finally:
+                    q.put(("done", None))
+
+            threading.Thread(target=worker,
+                             args=(self.q, task, files, rules, outdir),
+                             daemon=True).start()
 
     # ---------- LAN update ----------
     def on_check_update(self):
@@ -339,7 +368,26 @@ class App(tk.Tk):
 
         threading.Thread(target=worker, daemon=True).start()
 
+    def _poll_ocr_task(self):
+        """Read OCR progress from the worker process's JSON file (non-blocking)."""
+        tf = getattr(self, "_ocr_task_file", None)
+        if not tf or not os.path.isfile(tf):
+            return
+        try:
+            with open(tf, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            logs = data.get("logs", [])
+            for msg in logs[getattr(self, "_ocr_log_pos", 0):]:
+                self._append_log(msg)
+            self._ocr_log_pos = len(logs)
+            if data.get("done"):
+                self.q.put(("done", None))
+                self._ocr_task_file = None
+        except Exception:
+            pass  # file being rewritten by worker; try again next tick
+
     def _poll(self):
+        self._poll_ocr_task()
         try:
             while True:
                 kind, val = self.q.get_nowait()
@@ -404,9 +452,51 @@ def _selftest():
         log("SELFTEST ERR\n" + traceback.format_exc())
 
 
+def _ocr_worker(task_file):
+    """Run OCR in a standalone process; stream progress into the JSON file."""
+    data = {"files": [], "outdir": "", "logs": [], "done": False}
+    logs = []
+    try:
+        with open(task_file, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        logs = data.setdefault("logs", [])
+
+        def log(msg):
+            logs.append(str(msg))
+            data["logs"] = logs
+            tmp = task_file + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as out:
+                json.dump(data, out, ensure_ascii=False)
+            os.replace(tmp, task_file)
+
+        core.core_ocr(data["files"], None, data["outdir"], log)
+    except Exception:
+        try:
+            logs.append("OCR 进程异常：\n" + traceback.format_exc())
+            data["logs"] = logs
+            with open(task_file, "w", encoding="utf-8") as out:
+                json.dump(data, out, ensure_ascii=False)
+        except Exception:
+            pass
+    finally:
+        try:
+            data["done"] = True
+            tmp = task_file + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as out:
+                json.dump(data, out, ensure_ascii=False)
+            os.replace(tmp, task_file)
+        except Exception:
+            pass
+
+
 def main():
     if "--selftest" in sys.argv:
         _selftest()
+        return
+    if "--ocr-worker" in sys.argv:
+        i = sys.argv.index("--ocr-worker")
+        if i + 1 < len(sys.argv):
+            _ocr_worker(sys.argv[i + 1])
         return
     App().mainloop()
 

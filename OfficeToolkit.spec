@@ -1,16 +1,20 @@
 # -*- mode: python ; coding: utf-8 -*-
+from PyInstaller.utils.hooks import collect_data_files
+
+datas = []
+datas += collect_data_files('rapidocr_onnxruntime')
 
 
 a = Analysis(
     ['office_toolkit_gui.py'],
     pathex=[],
-    binaries=[('vendor/wcocr.pyd', '.')],
-    datas=[],
+    binaries=[],
+    datas=datas,
     hiddenimports=['clr', 'win32com.client', 'win32com.shell.shell', 'win32com.shell.shellcon'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=['torch', 'torchvision', 'scipy', 'numpy', 'pandas', 'matplotlib', 'PIL'],
+    excludes=['torch', 'torchvision', 'scipy', 'pandas', 'matplotlib', 'wcocr'],
     noarchive=False,
     optimize=0,
 )

@@ -331,83 +331,44 @@ def core_word2pdf(files, outdir, log):
 
 
 # ---------------------------------------------------------------------------
-# Scanned PDF -> searchable double-layer PDF (WeChat OCR [wcocr] + PyMuPDF)
+# Scanned PDF -> searchable double-layer PDF (RapidOCR + PyMuPDF)
 # ---------------------------------------------------------------------------
 CJK_FONT = r"C:/Windows/Fonts/simhei.ttf"
 OCR_DPI = 300
-_wcocr = None          # lazily initialized wcocr module
-_wcocr_ready = False
+_rapid_engine = None
 
 
-def _wechat_dirs():
-    """Locate WeChatOCR.exe and the dir holding mmmojo_64.dll.
-    In a PyInstaller EXE, resources sit next to the exe (vendor/WeChatOCR);
-    when running from source, they sit in <source dir>/vendor/WeChatOCR.
-    """
-    if getattr(sys, "frozen", False):
-        base = os.path.dirname(sys.executable)
-        candidates = [os.path.join(base, "WeChatOCR"),          # next to the EXE
-                      os.path.join(base, "vendor", "WeChatOCR")]
-    else:
-        base = os.path.dirname(os.path.abspath(__file__))
-        candidates = [os.path.join(base, "vendor", "WeChatOCR")]
-    for vendor in candidates:
-        ocr_exe = os.path.join(vendor, "WeChatOCR", "7079", "extracted", "WeChatOCR.exe")
-        if os.path.isfile(ocr_exe):
-            return ocr_exe, vendor
-    # fallback for a clear error message
-    return os.path.join(candidates[0], "WeChatOCR", "7079", "extracted", "WeChatOCR.exe"), candidates[0]
+def _init_rapid(log):
+    global _rapid_engine
+    if _rapid_engine is not None:
+        return _rapid_engine
+    log("正在加载 RapidOCR 引擎…")
+    from rapidocr_onnxruntime import RapidOCR
+    _rapid_engine = RapidOCR()
+    return _rapid_engine
 
 
-def _init_wcocr(log):
-    global _wcocr, _wcocr_ready
-    if _wcocr_ready:
-        return _wcocr
-    # In source mode the .pyd sits in ./vendor; in the EXE it is bundled at
-    # the root of _MEIPASS (already on sys.path).
-    if not getattr(sys, "frozen", False):
-        vendor_pyd = os.path.join(os.path.dirname(os.path.abspath(__file__)), "vendor")
-        if vendor_pyd not in sys.path:
-            sys.path.insert(0, vendor_pyd)
-    import wcocr
-    ocr_exe, wechat_dir = _wechat_dirs()
-    if not os.path.isfile(ocr_exe):
-        raise RuntimeError(f"缺少微信 OCR 组件：{ocr_exe}")
-    log("正在启动微信 OCR 引擎…")
-    wcocr.init(ocr_exe, wechat_dir)
-    _wcocr = wcocr
-    _wcocr_ready = True
-    return wcocr
-
-
-def _ocr_one(src, out, wc, log):
+def _ocr_one(src, out, engine, log):
     import fitz
     doc = fitz.open(src)
     total = 0
     try:
         for i, page in enumerate(doc, 1):
             pix = page.get_pixmap(dpi=OCR_DPI, colorspace=fitz.csGRAY, alpha=False)
-            fd, tmp = tempfile.mkstemp(suffix=".png")
-            try:
-                with os.fdopen(fd, "wb") as fh:
-                    fh.write(pix.tobytes("png"))
-                result = wc.ocr(tmp)
-            finally:
-                try:
-                    os.remove(tmp)
-                except Exception:
-                    pass
-            if result.get("errcode") not in (0, None):
-                raise RuntimeError(f"微信 OCR 返回错误码 {result.get('errcode')}")
+            result, _ = engine(pix.tobytes("png"))
             r = page.rect
-            sx, sy = r.width / result["width"], r.height / result["height"]
-            items = result.get("ocr_response") or []
-            for it in items:
-                text = it.get("text", "")
+            pw, ph = pix.width, pix.height
+            sx, sy = r.width / pw, r.height / ph
+            rows = result or []
+            for item in rows:
+                # RapidOCR item = [box4points, text, score]
+                box, text = item[0], item[1]
                 if not text:
                     continue
-                left, top = float(it["left"]), float(it["top"])
-                bottom = float(it["bottom"])
+                xs = [float(p[0]) for p in box]
+                ys = [float(p[1]) for p in box]
+                left, right = min(xs), max(xs)
+                top, bottom = min(ys), max(ys)
                 fontsize = max(4.0, (bottom - top) * sy * 0.95)
                 try:
                     page.insert_text((left * sx, bottom * sy), text,
@@ -415,8 +376,8 @@ def _ocr_one(src, out, wc, log):
                                      fontsize=fontsize, render_mode=3, overlay=True)
                 except Exception:
                     pass
-            total += len(items)
-            log(f"  第 {i}/{len(doc)} 页：识别 {len(items)} 行")
+            total += len(rows)
+            log(f"  第 {i}/{len(doc)} 页：识别 {len(rows)} 行")
         doc.save(out, garbage=3, deflate=True)
     finally:
         doc.close()
@@ -425,29 +386,23 @@ def _ocr_one(src, out, wc, log):
 
 def core_ocr(files, rules, outdir, log):
     """OCR scanned PDFs into double-layer (image + invisible text) PDFs,
-    using WeChat OCR. The engine is initialized once and reused."""
-    global _wcocr, _wcocr_ready
+    using RapidOCR. Engine is loaded once and reused."""
+    os.makedirs(outdir, exist_ok=True)
     ok = 0
-    wc = None
+    engine = None
     try:
-        wc = _init_wcocr(log)
+        engine = _init_rapid(log)
         for f in files:
             name = os.path.splitext(os.path.basename(f))[0] + "_ocr.pdf"
             out = unique_target(outdir, name)
             log(f"正在 OCR：{os.path.basename(f)}")
             try:
-                n = _ocr_one(f, out, wc, log)
+                n = _ocr_one(f, out, engine, log)
                 log(f"  [OK] -> {name}（文字 {n} 行）")
                 ok += 1
             except Exception as e:
                 log(f"  [失败] {type(e).__name__}: {e}")
-    finally:
-        if _wcocr_ready and wc is not None:
-            try:
-                wc.destroy()
-            except Exception:
-                pass
-        _wcocr_ready = False
-        _wcocr = None
+    except Exception as e:
+        log(f"  [失败] 引擎加载：{type(e).__name__}: {e}")
     log(f"完成：{ok}/{len(files)} 个成功")
     return ok
