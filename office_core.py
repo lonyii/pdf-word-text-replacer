@@ -125,9 +125,45 @@ def iter_job(job, files=None):
         time.sleep(0.1)
 
 
-# LAN update source: published release lives on the team share
+# LAN update source: published release is a ZIP archive on the team share
 SHARE_DIR = r"\\Jsztnas\团队文件\内部应用\OfficeToolkit-PDF-Word工具"
-SHARE_EXE = os.path.join(SHARE_DIR, "OfficeToolkit.exe")
+SHARE_ZIP = os.path.join(SHARE_DIR, "OfficeToolkit.zip")
+VERSION_FILE = "version.txt"
+
+
+def _version_tuple(text):
+    """'2026.11.19.1' -> (2026, 11, 19, 1); invalid -> (0,)."""
+    s = (text or "").strip().lstrip("vV")
+    try:
+        parts = tuple(int(x) for x in s.replace("-", ".").split(".") if x != "")
+        return parts or (0,)
+    except Exception:
+        return (0,)
+
+
+def _read_local_version():
+    exe = local_exe_path()
+    if not exe:
+        return None
+    p = os.path.join(os.path.dirname(exe), VERSION_FILE)
+    try:
+        with open(p, "r", encoding="utf-8-sig") as fh:
+            return fh.read().strip()
+    except Exception:
+        return None
+
+
+def _read_zip_version(zip_path):
+    import zipfile
+    try:
+        with zipfile.ZipFile(zip_path, "r") as zf:
+            names = [n for n in zf.namelist()
+                     if os.path.basename(n).lower() == VERSION_FILE.lower()]
+            if not names:
+                return None
+            return zf.read(names[0]).decode("utf-8-sig").strip()
+    except Exception:
+        return None
 
 
 def _md5(path, chunk=1024 * 1024):
@@ -148,47 +184,52 @@ def local_exe_path():
 
 
 def check_update():
-    """Compare local EXE with the LAN share. Returns a status dict."""
-    result = {"available": False, "msg": "", "remote_mtime": None}
-    if not os.path.isfile(SHARE_EXE):
-        result["msg"] = "无法访问局域网更新源：\n" + SHARE_EXE
+    """Compare local version.txt with the one inside the share ZIP.
+    Returns {"available", "msg", "local_version", "remote_version"}.
+    """
+    result = {"available": False, "msg": "", "local_version": None,
+              "remote_version": None}
+    if not os.path.isfile(SHARE_ZIP):
+        result["msg"] = "无法访问局域网更新源：\n" + SHARE_ZIP
         return result
-    remote_mtime = os.path.getmtime(SHARE_EXE)
-    result["remote_mtime"] = remote_mtime
     exe = local_exe_path()
     if not exe or not os.path.isfile(exe):
         result["msg"] = "当前不是 EXE 运行模式，无法自更新（请在打包后的程序中检查）"
         return result
-    try:
-        if _md5(exe) == _md5(SHARE_EXE):
-            result["msg"] = "已是最新版本"
-        else:
-            result["available"] = True
-            result["msg"] = "发现新版本，是否更新？"
-    except Exception as e:
-        result["msg"] = f"检查更新失败：{type(e).__name__}: {e}"
+    local_v = _read_local_version()
+    remote_v = _read_zip_version(SHARE_ZIP)
+    result["local_version"] = local_v
+    result["remote_version"] = remote_v
+    if not remote_v:
+        result["msg"] = "更新包缺少版本信息，已跳过更新"
+        return result
+    if local_v and _version_tuple(local_v) >= _version_tuple(remote_v):
+        result["msg"] = f"已是最新版本（{local_v}）"
+        return result
+    result["available"] = True
+    result["msg"] = f"发现新版本：{local_v or '未知'} → {remote_v}，是否更新？"
     return result
 
 
 def apply_update():
-    """Download the share EXE over the local one via a helper batch that runs
-    after this process exits (a running EXE cannot be overwritten in place).
-    Raises on error; returns True when the update has been scheduled.
+    """Copy the share ZIP locally, then run a helper batch after this process
+    exits that extracts it over the program directory and relaunches the app.
     """
     exe = local_exe_path()
-    if not exe or not os.path.isfile(SHARE_EXE):
+    if not exe or not os.path.isfile(SHARE_ZIP):
         raise RuntimeError("更新源或本地程序不可用")
     local_dir = os.path.dirname(exe)
-    new_exe = os.path.join(local_dir, "_ot_update_new.exe")
+    zip_local = os.path.join(local_dir, "_ot_update.zip")
     bat = os.path.join(local_dir, "_ot_update.bat")
-    shutil.copy2(SHARE_EXE, new_exe)
-    # GBK encoding for cmd.exe Chinese support; wait for this process to exit,
-    # replace, then relaunch.
+    shutil.copy2(SHARE_ZIP, zip_local)
+    # Expand-Archive -Force overwrites files; PowerShell handles Chinese names
+    # and onedir's many subfolders. Wait for this process to exit first.
     script = (
         "@echo off\r\n"
-        "chcp 936 >nul\r\n"
+        "chcp 65001 >nul\r\n"
         "timeout /t 3 /nobreak >nul\r\n"
-        f'move /Y "{new_exe}" "{exe}"\r\n'
+        f'powershell -NoProfile -Command "Expand-Archive -LiteralPath \'{zip_local}\' -DestinationPath \'{local_dir}\' -Force"\r\n'
+        f'del /F /Q "{zip_local}"\r\n'
         f'start "" "{exe}"\r\n'
         f'del "%~f0"\r\n'
     )

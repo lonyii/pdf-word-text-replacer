@@ -103,6 +103,7 @@ class TabPage(ttk.Frame):
             self.rule_tree.grid(row=0, column=0, sticky="nsew")
             rsb.grid(row=0, column=1, sticky="ns")
             self.rule_tree.bind("<Delete>", lambda e: self.del_rule())
+            self.rule_tree.bind("<Button-3>", self._show_rule_menu)
 
     # ---------- listbox interactions ----------
     def _setup_listbox_bindings(self):
@@ -152,8 +153,11 @@ class TabPage(ttk.Frame):
             self._append(paths)
 
     def _show_context_menu(self, event):
+        selected = set(self.listbox.curselection())
         i = self.listbox.nearest(event.y)
-        if 0 <= i < self.listbox.size():
+        # Only collapse to a single selection if the right-clicked row was not
+        # already selected; otherwise preserve the user's multi-selection.
+        if 0 <= i < self.listbox.size() and i not in selected:
             self.listbox.selection_clear(0, "end")
             self.listbox.selection_set(i)
         menu = tk.Menu(self, tearoff=0)
@@ -236,6 +240,39 @@ class TabPage(ttk.Frame):
             self.rule_tree.delete(item)
             if 0 <= i < len(self.rules):
                 self.rules.pop(i)
+
+    def clear_rules(self):
+        self.rules.clear()
+        for item in self.rule_tree.get_children():
+            self.rule_tree.delete(item)
+
+    def _show_rule_menu(self, event):
+        i = self.rule_tree.identify_row(event.y)
+        current = set(self.rule_tree.selection())
+        if i and i not in current:
+            self.rule_tree.selection_set(i)
+        menu = tk.Menu(self, tearoff=0)
+        menu.add_command(label="添加规则…", command=self._focus_rule_input)
+        if self.rule_tree.selection():
+            menu.add_separator()
+            menu.add_command(label="删除选中", command=self.del_rule)
+        if self.rule_tree.get_children():
+            menu.add_separator()
+            menu.add_command(label="清空全部规则", command=self.clear_rules)
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
+    def _focus_rule_input(self):
+        self.find_var.set("")
+        self.repl_var.set("")
+        # focus the "查找" entry so the user can type a new rule immediately
+        for w in self.winfo_children():
+            for c in w.winfo_children():
+                if isinstance(c, ttk.Entry):
+                    c.focus_set()
+                    return
 
     def log(self, msg):
         self.winfo_toplevel().push_log(str(msg))
