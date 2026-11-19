@@ -71,6 +71,7 @@ class TabPage(ttk.Frame):
             row += 1
             rf.columnconfigure(1, weight=1)
             rf.columnconfigure(3, weight=1)
+            rf.rowconfigure(1, weight=1)   # let the rule table grow with the window
 
             ttk.Label(rf, text="查找：").grid(row=0, column=0, sticky="w")
             self.find_var = tk.StringVar()
@@ -204,7 +205,7 @@ class App(tk.Tk):
         # ---- bottom fixed control bar ----
         bottom = ttk.LabelFrame(self, text=" 输出与执行 ", padding=(10, 6))
         bottom.grid(row=2, column=0, sticky="ew", padx=10, pady=(0, 6))
-        bottom.columnconfigure(1, weight=1)
+        bottom.columnconfigure(2, weight=1)   # give the path entry the extra space
 
         # output row
         ttk.Label(bottom, text="输出：").grid(row=0, column=0, sticky="w")
@@ -212,7 +213,7 @@ class App(tk.Tk):
         ttk.Radiobutton(bottom, text="桌面新建文件夹", variable=self.out_mode,
                         value="desktop", command=self._toggle_out).grid(row=0, column=1, sticky="w")
         self.out_var = tk.StringVar()
-        self.out_entry = ttk.Entry(bottom, textvariable=self.out_var, state="disabled")
+        self.out_entry = ttk.Entry(bottom, textvariable=self.out_var, state="disabled", width=60)
         self.out_entry.grid(row=0, column=2, sticky="ew", padx=(8, 4))
         self.out_btn = ttk.Button(bottom, text="浏览…", command=self._pick_out, state="disabled", width=7)
         self.out_btn.grid(row=0, column=3)

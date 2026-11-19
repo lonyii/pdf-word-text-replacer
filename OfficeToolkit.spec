@@ -8,13 +8,13 @@ datas += collect_data_files('rapidocr_onnxruntime')
 a = Analysis(
     ['office_toolkit_gui.py'],
     pathex=[],
-    binaries=[],
+    binaries=[('vendor/wcocr.pyd', '.')],
     datas=datas,
     hiddenimports=['clr', 'win32com.client', 'win32com.shell.shell', 'win32com.shell.shellcon'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=['torch', 'torchvision', 'scipy', 'pandas', 'matplotlib', 'wcocr'],
+    excludes=['torch', 'torchvision', 'scipy', 'pandas', 'matplotlib'],
     noarchive=False,
     optimize=0,
 )
