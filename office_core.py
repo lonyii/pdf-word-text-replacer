@@ -9,6 +9,8 @@ import shutil
 import hashlib
 import subprocess
 import datetime
+import asyncio
+import tempfile
 
 # LAN update source: published release lives on the team share
 SHARE_DIR = r"\\Jsztnas\团队文件\内部应用\OfficeToolkit-PDF-Word工具"
@@ -324,5 +326,96 @@ def core_word2pdf(files, outdir, log):
             except Exception:
                 pass
         pythoncom.CoUninitialize()
+    log(f"完成：{ok}/{len(files)} 个成功")
+    return ok
+
+
+# ---------------------------------------------------------------------------
+# Scanned PDF -> searchable double-layer PDF (Windows OCR + PyMuPDF)
+# ---------------------------------------------------------------------------
+CJK_FONT = r"C:/Windows/Fonts/simhei.ttf"
+OCR_DPI = 300
+
+
+async def _ocr_png_async(png_bytes, lang_tag="zh-Hans-CN"):
+    """Windows OCR on PNG bytes -> (words, pixel_w, pixel_h).
+    words = [(text, x, y, w, h), ...] in pixels."""
+    from winrt.windows.media.ocr import OcrEngine
+    from winrt.windows.graphics.imaging import BitmapDecoder
+    from winrt.windows.storage import StorageFile, FileAccessMode
+    from winrt.windows.globalization import Language
+
+    fd, tmp = tempfile.mkstemp(suffix=".png")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(png_bytes)
+        file = await StorageFile.get_file_from_path_async(tmp)
+        stream = await file.open_async(FileAccessMode.READ)
+        decoder = await BitmapDecoder.create_async(stream)
+        bitmap = await decoder.get_software_bitmap_async()
+        try:
+            engine = OcrEngine.try_create_from_language(Language(lang_tag))
+        except Exception:
+            engine = None
+        if engine is None:
+            engine = OcrEngine.try_create_from_user_profile_languages()
+        result = await engine.recognize_async(bitmap)
+        words = []
+        for line in result.lines:
+            for w in line.words:
+                b = w.bounding_rect
+                words.append((w.text, float(b.x), float(b.y),
+                              float(b.width), float(b.height)))
+        pw, ph = bitmap.pixel_width, bitmap.pixel_height
+        stream.close()
+        return words, pw, ph
+    finally:
+        try:
+            os.remove(tmp)
+        except Exception:
+            pass
+
+
+def _ocr_one(src, out, log):
+    import fitz
+    doc = fitz.open(src)
+    total = 0
+    try:
+        for i, page in enumerate(doc, 1):
+            pix = page.get_pixmap(dpi=OCR_DPI, colorspace=fitz.csGRAY, alpha=False)
+            words, pw, ph = asyncio.run(_ocr_png_async(pix.tobytes("png")))
+            r = page.rect
+            sx, sy = r.width / pw, r.height / ph
+            for text, x, y, w, h in words:
+                if not text:
+                    continue
+                fontsize = max(4.0, h * sy * 0.92)
+                try:
+                    page.insert_text((x * sx, (y + h * 0.82) * sy), text,
+                                     fontname="ocr_cjk", fontfile=CJK_FONT,
+                                     fontsize=fontsize, render_mode=3, overlay=True)
+                except Exception:
+                    pass
+            total += len(words)
+            log(f"  第 {i}/{len(doc)} 页：识别 {len(words)} 个词")
+        doc.save(out, garbage=3, deflate=True)
+    finally:
+        doc.close()
+    return total
+
+
+def core_ocr(files, rules, outdir, log):
+    """OCR scanned PDFs into double-layer (image + invisible text) PDFs."""
+    ok = 0
+    for f in files:
+        name = os.path.splitext(os.path.basename(f))[0] + "_ocr.pdf"
+        out = unique_target(outdir, name)
+        log(f"正在 OCR：{os.path.basename(f)}")
+        try:
+            n = _ocr_one(f, out, log)
+            log(f"  [OK] -> {name}（文字 {n} 词）")
+            ok += 1
+        except Exception as e:
+            log(f"  [失败] {type(e).__name__}: {e}")
     log(f"完成：{ok}/{len(files)} 个成功")
     return ok

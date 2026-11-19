@@ -151,7 +151,7 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title(APP_TITLE)
-        self.geometry("820x620")
+        self.geometry("860x630")
         self.minsize(700, 500)
         self.q = queue.Queue()
         self.running = False
@@ -179,17 +179,21 @@ class App(tk.Tk):
         self.pdf = TabPage(nb, (".pdf",))
         self.rep = TabPage(nb, (".docx", ".doc"), with_rules=True)
         self.w2p = TabPage(nb, (".docx", ".doc"))
+        self.ocr = TabPage(nb, (".pdf",))
         self.pdf.output_prefix = "PDF转Word"
         self.rep.output_prefix = "文本替换"
         self.w2p.output_prefix = "Word转PDF"
-        self.pages = [self.pdf, self.rep, self.w2p]
+        self.ocr.output_prefix = "OCR双层PDF"
+        self.pages = [self.pdf, self.rep, self.w2p, self.ocr]
         # normalize all tasks to (files, rules, outdir, log)
         self.tasks = [
             lambda f, r, o, log: core.core_pdf2word(f, o, log),
             lambda f, r, o, log: core.core_replace(f, r, o, log),
             lambda f, r, o, log: core.core_word2pdf(f, o, log),
+            lambda f, r, o, log: core.core_ocr(f, r, o, log),
         ]
-        for p, name in zip(self.pages, (" PDF 转 Word ", " 批量替换文本 ", " Word 转 PDF ")):
+        for p, name in zip(self.pages,
+                           (" PDF 转 Word ", " 批量替换文本 ", " Word 转 PDF ", " 扫描件 OCR ")):
             nb.add(p, text=name)
         self.nb = nb
         self.current = self.pdf
@@ -374,8 +378,7 @@ class App(tk.Tk):
 def _selftest():
     import traceback
     args = sys.argv[2:]
-    pdf = args[0] if args else r"D:\Documents\桌面\新建文件夹 (8)\NC26E444-b.线上资料.pdf"
-    outdir = args[1] if len(args) > 1 else os.path.join(os.environ.get("TEMP", "C:\\Temp"), "ot_selftest")
+    mode = args[0] if args else "pdf2word"
     logfile = os.path.join(os.environ.get("TEMP", "C:\\Temp"), "ot_selftest_log.txt")
     lines = []
     def log(m):
@@ -383,10 +386,20 @@ def _selftest():
         with open(logfile, "w", encoding="utf-8") as fh:
             fh.write("\n".join(lines))
     try:
-        os.makedirs(outdir, exist_ok=True)
-        log("SELFTEST START")
-        core.core_pdf2word([pdf], outdir, log)
-        log("SELFTEST DONE " + repr(os.listdir(outdir)))
+        if mode == "ocr":
+            pdf = args[1] if len(args) > 1 else ""
+            outdir = args[2] if len(args) > 2 else os.path.join(os.environ.get("TEMP", "C:\\Temp"), "ot_ocr_selftest")
+            os.makedirs(outdir, exist_ok=True)
+            log("SELFTEST OCR START")
+            core.core_ocr([pdf], None, outdir, log)
+            log("SELFTEST OCR DONE " + repr(os.listdir(outdir)))
+        else:
+            pdf = args[1] if len(args) > 1 else r"D:\Documents\桌面\新建文件夹 (8)\NC26E444-b.线上资料.pdf"
+            outdir = args[2] if len(args) > 2 else os.path.join(os.environ.get("TEMP", "C:\\Temp"), "ot_selftest")
+            os.makedirs(outdir, exist_ok=True)
+            log("SELFTEST START")
+            core.core_pdf2word([pdf], outdir, log)
+            log("SELFTEST DONE " + repr(os.listdir(outdir)))
     except Exception:
         log("SELFTEST ERR\n" + traceback.format_exc())
 
