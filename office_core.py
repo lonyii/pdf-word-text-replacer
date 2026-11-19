@@ -331,73 +331,92 @@ def core_word2pdf(files, outdir, log):
 
 
 # ---------------------------------------------------------------------------
-# Scanned PDF -> searchable double-layer PDF (Windows OCR + PyMuPDF)
+# Scanned PDF -> searchable double-layer PDF (WeChat OCR [wcocr] + PyMuPDF)
 # ---------------------------------------------------------------------------
 CJK_FONT = r"C:/Windows/Fonts/simhei.ttf"
 OCR_DPI = 300
+_wcocr = None          # lazily initialized wcocr module
+_wcocr_ready = False
 
 
-async def _ocr_png_async(png_bytes, lang_tag="zh-Hans-CN"):
-    """Windows OCR on PNG bytes -> (words, pixel_w, pixel_h).
-    words = [(text, x, y, w, h), ...] in pixels."""
-    from winrt.windows.media.ocr import OcrEngine
-    from winrt.windows.graphics.imaging import BitmapDecoder
-    from winrt.windows.storage import StorageFile, FileAccessMode
-    from winrt.windows.globalization import Language
-
-    fd, tmp = tempfile.mkstemp(suffix=".png")
-    try:
-        with os.fdopen(fd, "wb") as f:
-            f.write(png_bytes)
-        file = await StorageFile.get_file_from_path_async(tmp)
-        stream = await file.open_async(FileAccessMode.READ)
-        decoder = await BitmapDecoder.create_async(stream)
-        bitmap = await decoder.get_software_bitmap_async()
-        try:
-            engine = OcrEngine.try_create_from_language(Language(lang_tag))
-        except Exception:
-            engine = None
-        if engine is None:
-            engine = OcrEngine.try_create_from_user_profile_languages()
-        result = await engine.recognize_async(bitmap)
-        words = []
-        for line in result.lines:
-            for w in line.words:
-                b = w.bounding_rect
-                words.append((w.text, float(b.x), float(b.y),
-                              float(b.width), float(b.height)))
-        pw, ph = bitmap.pixel_width, bitmap.pixel_height
-        stream.close()
-        return words, pw, ph
-    finally:
-        try:
-            os.remove(tmp)
-        except Exception:
-            pass
+def _wechat_dirs():
+    """Locate WeChatOCR.exe and the dir holding mmmojo_64.dll.
+    In a PyInstaller EXE, resources sit next to the exe (vendor/WeChatOCR);
+    when running from source, they sit in <source dir>/vendor/WeChatOCR.
+    """
+    if getattr(sys, "frozen", False):
+        base = os.path.dirname(sys.executable)
+        candidates = [os.path.join(base, "WeChatOCR"),          # next to the EXE
+                      os.path.join(base, "vendor", "WeChatOCR")]
+    else:
+        base = os.path.dirname(os.path.abspath(__file__))
+        candidates = [os.path.join(base, "vendor", "WeChatOCR")]
+    for vendor in candidates:
+        ocr_exe = os.path.join(vendor, "WeChatOCR", "7079", "extracted", "WeChatOCR.exe")
+        if os.path.isfile(ocr_exe):
+            return ocr_exe, vendor
+    # fallback for a clear error message
+    return os.path.join(candidates[0], "WeChatOCR", "7079", "extracted", "WeChatOCR.exe"), candidates[0]
 
 
-def _ocr_one(src, out, log):
+def _init_wcocr(log):
+    global _wcocr, _wcocr_ready
+    if _wcocr_ready:
+        return _wcocr
+    # In source mode the .pyd sits in ./vendor; in the EXE it is bundled at
+    # the root of _MEIPASS (already on sys.path).
+    if not getattr(sys, "frozen", False):
+        vendor_pyd = os.path.join(os.path.dirname(os.path.abspath(__file__)), "vendor")
+        if vendor_pyd not in sys.path:
+            sys.path.insert(0, vendor_pyd)
+    import wcocr
+    ocr_exe, wechat_dir = _wechat_dirs()
+    if not os.path.isfile(ocr_exe):
+        raise RuntimeError(f"缺少微信 OCR 组件：{ocr_exe}")
+    log("正在启动微信 OCR 引擎…")
+    wcocr.init(ocr_exe, wechat_dir)
+    _wcocr = wcocr
+    _wcocr_ready = True
+    return wcocr
+
+
+def _ocr_one(src, out, wc, log):
     import fitz
     doc = fitz.open(src)
     total = 0
     try:
         for i, page in enumerate(doc, 1):
             pix = page.get_pixmap(dpi=OCR_DPI, colorspace=fitz.csGRAY, alpha=False)
-            words, pw, ph = asyncio.run(_ocr_png_async(pix.tobytes("png")))
+            fd, tmp = tempfile.mkstemp(suffix=".png")
+            try:
+                with os.fdopen(fd, "wb") as fh:
+                    fh.write(pix.tobytes("png"))
+                result = wc.ocr(tmp)
+            finally:
+                try:
+                    os.remove(tmp)
+                except Exception:
+                    pass
+            if result.get("errcode") not in (0, None):
+                raise RuntimeError(f"微信 OCR 返回错误码 {result.get('errcode')}")
             r = page.rect
-            sx, sy = r.width / pw, r.height / ph
-            for text, x, y, w, h in words:
+            sx, sy = r.width / result["width"], r.height / result["height"]
+            items = result.get("ocr_response") or []
+            for it in items:
+                text = it.get("text", "")
                 if not text:
                     continue
-                fontsize = max(4.0, h * sy * 0.92)
+                left, top = float(it["left"]), float(it["top"])
+                bottom = float(it["bottom"])
+                fontsize = max(4.0, (bottom - top) * sy * 0.95)
                 try:
-                    page.insert_text((x * sx, (y + h * 0.82) * sy), text,
+                    page.insert_text((left * sx, bottom * sy), text,
                                      fontname="ocr_cjk", fontfile=CJK_FONT,
                                      fontsize=fontsize, render_mode=3, overlay=True)
                 except Exception:
                     pass
-            total += len(words)
-            log(f"  第 {i}/{len(doc)} 页：识别 {len(words)} 个词")
+            total += len(items)
+            log(f"  第 {i}/{len(doc)} 页：识别 {len(items)} 行")
         doc.save(out, garbage=3, deflate=True)
     finally:
         doc.close()
@@ -405,17 +424,30 @@ def _ocr_one(src, out, log):
 
 
 def core_ocr(files, rules, outdir, log):
-    """OCR scanned PDFs into double-layer (image + invisible text) PDFs."""
+    """OCR scanned PDFs into double-layer (image + invisible text) PDFs,
+    using WeChat OCR. The engine is initialized once and reused."""
+    global _wcocr, _wcocr_ready
     ok = 0
-    for f in files:
-        name = os.path.splitext(os.path.basename(f))[0] + "_ocr.pdf"
-        out = unique_target(outdir, name)
-        log(f"正在 OCR：{os.path.basename(f)}")
-        try:
-            n = _ocr_one(f, out, log)
-            log(f"  [OK] -> {name}（文字 {n} 词）")
-            ok += 1
-        except Exception as e:
-            log(f"  [失败] {type(e).__name__}: {e}")
+    wc = None
+    try:
+        wc = _init_wcocr(log)
+        for f in files:
+            name = os.path.splitext(os.path.basename(f))[0] + "_ocr.pdf"
+            out = unique_target(outdir, name)
+            log(f"正在 OCR：{os.path.basename(f)}")
+            try:
+                n = _ocr_one(f, out, wc, log)
+                log(f"  [OK] -> {name}（文字 {n} 行）")
+                ok += 1
+            except Exception as e:
+                log(f"  [失败] {type(e).__name__}: {e}")
+    finally:
+        if _wcocr_ready and wc is not None:
+            try:
+                wc.destroy()
+            except Exception:
+                pass
+        _wcocr_ready = False
+        _wcocr = None
     log(f"完成：{ok}/{len(files)} 个成功")
     return ok
