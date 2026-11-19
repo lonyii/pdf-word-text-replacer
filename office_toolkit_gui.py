@@ -15,6 +15,12 @@ import traceback
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
+try:
+    from tkinterdnd2 import TkinterDnD
+    _DND = True
+except Exception:
+    _DND = False
+
 import office_core as core
 
 APP_TITLE = "OfficeToolkit  ·  PDF / Word 批量处理工具"
@@ -62,6 +68,7 @@ class TabPage(ttk.Frame):
         self.listbox.configure(yscrollcommand=sb.set)
         self.listbox.grid(row=0, column=0, sticky="nsew")
         sb.grid(row=0, column=1, sticky="ns")
+        self._setup_listbox_bindings()
 
         # ---- rules (replace tab only) ----
         if with_rules:
@@ -97,6 +104,86 @@ class TabPage(ttk.Frame):
             rsb.grid(row=0, column=1, sticky="ns")
             self.rule_tree.bind("<Delete>", lambda e: self.del_rule())
 
+    # ---------- listbox interactions ----------
+    def _setup_listbox_bindings(self):
+        lb = self.listbox
+        lb.bind("<Control-v>", lambda e: self._on_paste())
+        lb.bind("<Delete>", lambda e: self._delete_selected())
+        lb.bind("<Button-3>", self._show_context_menu)
+        if _DND:
+            try:
+                lb.drop_target_register("DND_Files")
+                lb.dnd_bind("<<Drop>>", self._on_drop)
+            except Exception:
+                pass
+
+    @staticmethod
+    def _parse_dnd(data):
+        """Parse tkinterdnd2 file drop payload -> list of paths."""
+        paths, buf, in_brace = [], "", False
+        for ch in data:
+            if ch == "{":
+                in_brace = True
+            elif ch == "}":
+                in_brace = False
+                if buf:
+                    paths.append(buf); buf = ""
+            elif ch.isspace() and not in_brace:
+                if buf:
+                    paths.append(buf); buf = ""
+            else:
+                buf += ch
+        if buf:
+            paths.append(buf)
+        return paths
+
+    def _on_drop(self, event):
+        self._append(self._parse_dnd(event.data))
+
+    def _on_paste(self):
+        try:
+            data = self.clipboard_get()
+        except Exception:
+            return
+        # Windows Explorer copies files as newline-separated paths (or CF_HDROP
+        # rendered to text). Accept each non-empty line as a path.
+        paths = [ln.strip().strip('"') for ln in data.splitlines() if ln.strip()]
+        if paths:
+            self._append(paths)
+
+    def _show_context_menu(self, event):
+        i = self.listbox.nearest(event.y)
+        if 0 <= i < self.listbox.size():
+            self.listbox.selection_clear(0, "end")
+            self.listbox.selection_set(i)
+        menu = tk.Menu(self, tearoff=0)
+        menu.add_command(label="添加文件…", command=self.add_files)
+        menu.add_command(label="添加文件夹…", command=self.add_folder)
+        if self.listbox.curselection():
+            menu.add_separator()
+            menu.add_command(label="删除选中", command=self._delete_selected)
+        menu.add_separator()
+        menu.add_command(label="清空列表", command=self.clear_files)
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
+    def _delete_selected(self):
+        sel = list(self.listbox.curselection())
+        if not sel:
+            return
+        paths = [self.files[i] for i in sel if 0 <= i < len(self.files)]
+        for i in reversed(sel):
+            self.listbox.delete(i)
+        for p in paths:
+            if p in self.files:
+                self.files.remove(p)
+        app = self.winfo_toplevel()
+        if hasattr(app, "notify_files_removed"):
+            app.notify_files_removed(self, paths)
+        self.log(f"已删除 {len(paths)} 项")
+
     # ---------- file helpers ----------
     def add_files(self):
         ftypes = [(f"{e} 文件", f"*{e}") for e in self.file_exts]
@@ -109,19 +196,26 @@ class TabPage(ttk.Frame):
             self._append([d])
 
     def _append(self, paths):
-        n = 0
+        added = []
         for p in paths:
             for f in core.expand_paths([p], self.file_exts):
                 if f not in self.files:
                     self.files.append(f)
                     self.listbox.insert("end", f)
-                    n += 1
-        if n:
-            self.log(f"已添加 {n} 个文件")
+                    added.append(f)
+        if added:
+            app = self.winfo_toplevel()
+            if hasattr(app, "notify_files_added"):
+                app.notify_files_added(self, added)
+            self.log(f"已添加 {len(added)} 个文件")
 
     def clear_files(self):
+        old = list(self.files)
         self.files.clear()
         self.listbox.delete(0, "end")
+        app = self.winfo_toplevel()
+        if hasattr(app, "notify_files_removed"):
+            app.notify_files_removed(self, old)
         self.log("已清空文件列表")
 
     # ---------- rule helpers ----------
@@ -150,7 +244,7 @@ class TabPage(ttk.Frame):
 # ===========================================================================
 # Main window
 # ===========================================================================
-class App(tk.Tk):
+class App(TkinterDnD.Tk if _DND else tk.Tk):
     def __init__(self):
         super().__init__()
         self.title(APP_TITLE)
@@ -188,12 +282,12 @@ class App(tk.Tk):
         self.w2p.output_prefix = "Word转PDF"
         self.ocr.output_prefix = "OCR双层PDF"
         self.pages = [self.pdf, self.rep, self.w2p, self.ocr]
-        # normalize all tasks to (files, rules, outdir, log)
+        # normalize all tasks to (files, rules, outdir, log, job)
         self.tasks = [
-            lambda f, r, o, log: core.core_pdf2word(f, o, log),
-            lambda f, r, o, log: core.core_replace(f, r, o, log),
-            lambda f, r, o, log: core.core_word2pdf(f, o, log),
-            lambda f, r, o, log: core.core_ocr(f, r, o, log),
+            lambda f, r, o, log, job: core.core_pdf2word(f, o, log, job),
+            lambda f, r, o, log, job: core.core_replace(f, r, o, log, job),
+            lambda f, r, o, log, job: core.core_word2pdf(f, o, log, job),
+            lambda f, r, o, log, job: core.core_ocr(f, r, o, log, job),
         ]
         for p, name in zip(self.pages,
                            (" PDF 转 Word ", " 批量替换文本 ", " Word 转 PDF ", " 扫描件 OCR ")):
@@ -260,6 +354,60 @@ class App(tk.Tk):
     def push_log(self, msg):
         self.q.put(("log", str(msg)))
 
+    # ---------- dynamic file queue during processing ----------
+    def notify_files_added(self, page, paths):
+        if not self.running or getattr(self, "job_page", None) is not page:
+            return
+        job = getattr(self, "job", None)
+        if job is not None:
+            job.add(paths)
+            self.push_log(f"已加入处理队列：{len(paths)} 个文件")
+        elif page is self.ocr and getattr(self, "_ocr_task_file", None):
+            self._ocr_queue_add(paths)
+
+    def notify_files_removed(self, page, paths):
+        if not self.running or getattr(self, "job_page", None) is not page:
+            return
+        job = getattr(self, "job", None)
+        if job is not None:
+            removed, cancelled = job.remove(paths)
+            if cancelled:
+                self.push_log(f"已取消正在处理的文件：{cancelled} 个（处理完当前后跳过）")
+            elif removed:
+                self.push_log(f"已从队列移除：{removed} 个文件")
+        elif page is self.ocr and getattr(self, "_ocr_task_file", None):
+            self._ocr_queue_remove(paths)
+
+    def _ocr_queue_add(self, paths):
+        try:
+            with open(self._ocr_task_file, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            q = data.setdefault("queue_add", [])
+            for p in paths:
+                if p not in q:
+                    q.append(p)
+            self._write_ocr_task(data)
+        except Exception:
+            pass
+
+    def _ocr_queue_remove(self, paths):
+        try:
+            with open(self._ocr_task_file, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            q = data.setdefault("queue_remove", [])
+            for p in paths:
+                if p not in q:
+                    q.append(p)
+            self._write_ocr_task(data)
+        except Exception:
+            pass
+
+    def _write_ocr_task(self, data):
+        tmp = self._ocr_task_file + ".gui.tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, ensure_ascii=False)
+        os.replace(tmp, self._ocr_task_file)
+
     # ---------- start ----------
     def on_start(self):
         if self.running:
@@ -284,6 +432,7 @@ class App(tk.Tk):
         self.push_log(f"开始处理 {len(files)} 个文件 → {outdir}")
         self.running = True
         page.running = True
+        self.job_page = page
         self.start_btn.configure(state="disabled", text="处理中…")
         self.progress.start(12)
 
@@ -314,19 +463,22 @@ class App(tk.Tk):
             self._ocr_log_pos = 0
         else:
             task = self.tasks[idx]
+            job = core.JobQueue(files)
+            job.idle_timeout = 2.0   # allow files added during processing
+            self.job = job
 
-            def worker(q, task, files, rules, outdir):
+            def worker(q, task, files, rules, outdir, job):
                 def op_log(m):
                     q.put(("log", str(m)))
                 try:
-                    task(files, rules, outdir, op_log)
+                    task(files, rules, outdir, op_log, job)
                 except Exception:
                     q.put(("log", "异常：\n" + traceback.format_exc()))
                 finally:
                     q.put(("done", None))
 
             threading.Thread(target=worker,
-                             args=(self.q, task, files, rules, outdir),
+                             args=(self.q, task, files, rules, outdir, job),
                              daemon=True).start()
 
     # ---------- LAN update ----------
@@ -399,6 +551,9 @@ class App(tk.Tk):
                     self.log_text.configure(state="disabled")
                 elif kind == "done":
                     self.running = False
+                    self.job = None
+                    self.job_page = None
+                    self._ocr_task_file = None
                     for p in self.pages:
                         p.running = False
                     self.start_btn.configure(state="normal", text="开始处理")
@@ -454,38 +609,81 @@ def _selftest():
 
 
 def _ocr_worker(task_file):
-    """Run OCR in a standalone process; stream progress into the JSON file."""
+    """Run OCR in a standalone process; stream progress into the JSON file.
+    A small watcher thread applies dynamic add/remove requests from the GUI.
+    """
+    import time
     data = {"files": [], "outdir": "", "logs": [], "done": False}
     logs = []
+    wlock = threading.Lock()
+
+    def save():
+        tmp = task_file + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as out:
+            json.dump(data, out, ensure_ascii=False)
+        os.replace(tmp, task_file)
+
+    def log(msg):
+        with wlock:
+            logs.append(str(msg))
+            data["logs"] = logs
+            save()
+
     try:
         with open(task_file, "r", encoding="utf-8") as fh:
             data = json.load(fh)
         logs = data.setdefault("logs", [])
+        job = core.JobQueue(data.get("files", []))
+        job.idle_timeout = 2.0
+        stop = threading.Event()
 
-        def log(msg):
-            logs.append(str(msg))
-            data["logs"] = logs
-            tmp = task_file + ".tmp"
-            with open(tmp, "w", encoding="utf-8") as out:
-                json.dump(data, out, ensure_ascii=False)
-            os.replace(tmp, task_file)
+        def watcher():
+            while not stop.is_set():
+                time.sleep(0.3)
+                try:
+                    with open(task_file, "r", encoding="utf-8") as fh:
+                        cur = json.load(fh)
+                    changed = False
+                    adds = cur.pop("queue_add", []) or []
+                    rems = cur.pop("queue_remove", []) or []
+                    if adds:
+                        job.add(adds); changed = True
+                        with wlock:
+                            logs.append(f"已加入处理队列：{len(adds)} 个文件")
+                    if rems:
+                        removed, cancelled = job.remove(rems); changed = True
+                        with wlock:
+                            if cancelled:
+                                logs.append(f"已取消正在处理的文件：{cancelled} 个")
+                            elif removed:
+                                logs.append(f"已从队列移除：{removed} 个文件")
+                    if changed:
+                        data["logs"] = logs
+                        with wlock:
+                            save()
+                except Exception:
+                    pass
 
-        core.core_ocr(data["files"], None, data["outdir"], log)
+        wt = threading.Thread(target=watcher, daemon=True)
+        wt.start()
+        try:
+            core.core_ocr(data.get("files", []), None, data["outdir"], log, job)
+        finally:
+            stop.set()
     except Exception:
         try:
-            logs.append("OCR 进程异常：\n" + traceback.format_exc())
-            data["logs"] = logs
-            with open(task_file, "w", encoding="utf-8") as out:
-                json.dump(data, out, ensure_ascii=False)
+            with wlock:
+                logs.append("OCR 进程异常：\n" + traceback.format_exc())
+                save()
         except Exception:
             pass
     finally:
         try:
-            data["done"] = True
-            tmp = task_file + ".tmp"
-            with open(tmp, "w", encoding="utf-8") as out:
-                json.dump(data, out, ensure_ascii=False)
-            os.replace(tmp, task_file)
+            with wlock:
+                data["done"] = True
+                save()
+        except Exception:
+            pass
         except Exception:
             pass
 

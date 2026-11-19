@@ -11,6 +11,119 @@ import subprocess
 import datetime
 import asyncio
 import tempfile
+import threading
+
+
+class JobQueue:
+    """Thread-safe work queue shared between the GUI and a worker thread.
+
+    The GUI can add files while processing, and remove files that are either
+    still pending or currently being processed. Removing the active file marks
+    it cancelled: the worker finishes the current (non-interruptible) COM / OCR
+    call, discards its result, and moves on to the next file.
+    """
+    def __init__(self, files):
+        self._lock = threading.Lock()
+        self._pending = list(files)
+        self._cancelled = set()
+        self._current = None
+        self._closed = False           # no more files will be added
+        self._empty_since = None
+        self.idle_timeout = 0.0        # >0: auto-finish after idle seconds
+
+    def take(self):
+        """Return a file to process, None if busy/empty. Caller should loop."""
+        with self._lock:
+            if self._current is not None:
+                return None            # worker still busy
+            if not self._pending:
+                return None
+            self._current = self._pending.pop(0)
+            return self._current
+
+    def is_done(self, idle_timeout=0.0):
+        """True when closed and drained. If idle_timeout > 0, also finish
+        after the queue has been empty for that many seconds (lets late adds
+        arrive during processing without hanging forever)."""
+        import time
+        with self._lock:
+            if self._closed and not self._pending and self._current is None:
+                return True
+            if idle_timeout > 0 and not self._pending and self._current is None:
+                if self._empty_since is None:
+                    self._empty_since = time.time()
+                elif time.time() - self._empty_since >= idle_timeout:
+                    return True
+            else:
+                self._empty_since = None
+            return False
+
+    def close(self):
+        with self._lock:
+            self._closed = True
+
+    def release(self):
+        with self._lock:
+            self._current = None
+
+    def is_cancelled(self, path):
+        with self._lock:
+            return path in self._cancelled
+
+    def add(self, paths):
+        added = 0
+        with self._lock:
+            for p in paths:
+                if p not in self._pending and p != self._current and p not in self._cancelled:
+                    self._pending.append(p)
+                    added += 1
+        return added
+
+    def remove(self, paths):
+        """Remove pending files; mark the active one cancelled."""
+        removed, cancelled = 0, 0
+        with self._lock:
+            for p in paths:
+                if p in self._pending:
+                    self._pending.remove(p)
+                    removed += 1
+                elif p == self._current:
+                    self._cancelled.add(p)
+                    cancelled += 1
+        return removed, cancelled
+
+    def pending_count(self):
+        with self._lock:
+            return len(self._pending)
+
+    def snapshot(self):
+        with self._lock:
+            return list(self._pending), self._current, set(self._cancelled)
+
+
+def iter_job(job, files=None):
+    """Yield files one at a time from a JobQueue, or from a plain list.
+    For the queue case, waits for new additions until job.close() and drained.
+    Yields (file, cancelled) so callers can skip removed-in-flight files.
+    """
+    import time
+    if job is None:
+        for f in (files or []):
+            yield f, False
+        return
+    while True:
+        f = job.take()
+        if f is not None:
+            cancelled = job.is_cancelled(f)
+            try:
+                yield f, cancelled
+            finally:
+                job.release()
+            continue
+        if job.is_done(job.idle_timeout):
+            break
+        time.sleep(0.1)
+
 
 # LAN update source: published release lives on the team share
 SHARE_DIR = r"\\Jsztnas\团队文件\内部应用\OfficeToolkit-PDF-Word工具"
@@ -198,27 +311,45 @@ def _acrobat_convert(pdf, out):
                     pass
 
 
-def core_pdf2word(files, outdir, log):
+def core_pdf2word(files, outdir, log, job=None):
     # .NET/COM calls from a worker thread need an initialized COM apartment.
     import pythoncom
     pythoncom.CoInitialize()
     ok = 0
+    processed = 0
     try:
-        for i, f in enumerate(files, 1):
+        for f, cancelled in iter_job(job, files):
+            processed += 1
             name = os.path.splitext(os.path.basename(f))[0] + ".docx"
             out = unique_target(outdir, name)
-            log(f"[{i}/{len(files)}] 正在转换：{os.path.basename(f)} …")
+            log(f"[{processed}] 正在转换：{os.path.basename(f)} …")
+            if cancelled:
+                log(f"  [已取消] {os.path.basename(f)}")
+                continue
+            result = None
             try:
-                if _acrobat_convert(f, out):
-                    log(f"  [OK] -> {name}")
-                    ok += 1
-                else:
-                    log(f"  [失败] Acrobat 未生成输出")
+                result = _acrobat_convert(f, out)
             except Exception as e:
-                log(f"  [失败] {type(e).__name__}: {e}")
+                result = e
+            # Re-check cancellation after the (non-interruptible) conversion:
+            # deleting the active file marks it cancelled mid-flight.
+            if job is not None and job.is_cancelled(f):
+                log(f"  [已取消] {os.path.basename(f)}（已中断，不计入结果）")
+                if os.path.exists(out):
+                    try:
+                        os.remove(out)
+                    except Exception:
+                        pass
+            elif isinstance(result, Exception):
+                log(f"  [失败] {type(result).__name__}: {result}")
+            elif result:
+                log(f"  [OK] -> {name}")
+                ok += 1
+            else:
+                log(f"  [失败] Acrobat 未生成输出")
     finally:
         pythoncom.CoUninitialize()
-    log(f"完成：{ok}/{len(files)} 个成功")
+    log(f"完成：{ok}/{processed} 个成功")
     return ok
 
 
@@ -245,18 +376,26 @@ def _apply_rules_story(story, rules):
         )
 
 
-def core_replace(files, rules, outdir, log):
+def core_replace(files, rules, outdir, log, job=None):
     import pythoncom
     import win32com.client as win32
     pythoncom.CoInitialize()
     word = None
     ok = 0
+    processed = 0
     try:
         word = win32.DispatchEx("Word.Application")
         word.Visible = False
         word.DisplayAlerts = 0
-        for src in files:
+        for src, cancelled in iter_job(job, files):
+            processed += 1
+            if cancelled:
+                log(f"[已取消] {os.path.basename(src)}")
+                continue
             doc = None
+            name = os.path.splitext(os.path.basename(src))[0] + ".docx"
+            dst = unique_target(outdir, name)
+            err = None
             try:
                 doc = word.Documents.Open(src, False, True, False)
                 for story in doc.StoryRanges:
@@ -265,19 +404,27 @@ def core_replace(files, rules, outdir, log):
                     while linked is not None:
                         _apply_rules_story(linked, rules)
                         linked = getattr(linked, "NextStoryRange", None)
-                name = os.path.splitext(os.path.basename(src))[0] + ".docx"
-                dst = unique_target(outdir, name)
                 doc.SaveAs2(dst, 12)
-                log(f"[OK] {os.path.basename(src)} -> {name}")
-                ok += 1
             except Exception as e:
-                log(f"[失败] {os.path.basename(src)}：{type(e).__name__}: {e}")
+                err = e
             finally:
                 if doc is not None:
                     try:
                         doc.Close(False)
                     except Exception:
                         pass
+            if job is not None and job.is_cancelled(src):
+                log(f"[已取消] {os.path.basename(src)}（已中断，不计入结果）")
+                if os.path.exists(dst):
+                    try:
+                        os.remove(dst)
+                    except Exception:
+                        pass
+            elif err is not None:
+                log(f"[失败] {os.path.basename(src)}：{type(err).__name__}: {err}")
+            else:
+                log(f"[OK] {os.path.basename(src)} -> {name}")
+                ok += 1
     finally:
         if word is not None:
             try:
@@ -285,40 +432,56 @@ def core_replace(files, rules, outdir, log):
             except Exception:
                 pass
         pythoncom.CoUninitialize()
-    log(f"完成：{ok}/{len(files)} 个成功")
+    log(f"完成：{ok}/{processed} 个成功")
     return ok
 
 
 # ---------------------------------------------------------------------------
 # Word -> PDF
 # ---------------------------------------------------------------------------
-def core_word2pdf(files, outdir, log):
+def core_word2pdf(files, outdir, log, job=None):
     import pythoncom
     import win32com.client as win32
     pythoncom.CoInitialize()
     word = None
     ok = 0
+    processed = 0
     try:
         word = win32.DispatchEx("Word.Application")
         word.Visible = False
         word.DisplayAlerts = 0
-        for src in files:
+        for src, cancelled in iter_job(job, files):
+            processed += 1
+            if cancelled:
+                log(f"[已取消] {os.path.basename(src)}")
+                continue
             doc = None
+            name = os.path.splitext(os.path.basename(src))[0] + ".pdf"
+            dst = unique_target(outdir, name)
+            err = None
             try:
                 doc = word.Documents.Open(src, False, True, False)
-                name = os.path.splitext(os.path.basename(src))[0] + ".pdf"
-                dst = unique_target(outdir, name)
                 doc.ExportAsFixedFormat(dst, 17)  # wdExportFormatPDF
-                log(f"[OK] {os.path.basename(src)} -> {name}")
-                ok += 1
             except Exception as e:
-                log(f"[失败] {os.path.basename(src)}：{type(e).__name__}: {e}")
+                err = e
             finally:
                 if doc is not None:
                     try:
                         doc.Close(False)
                     except Exception:
                         pass
+            if job is not None and job.is_cancelled(src):
+                log(f"[已取消] {os.path.basename(src)}（已中断，不计入结果）")
+                if os.path.exists(dst):
+                    try:
+                        os.remove(dst)
+                    except Exception:
+                        pass
+            elif err is not None:
+                log(f"[失败] {os.path.basename(src)}：{type(err).__name__}: {err}")
+            else:
+                log(f"[OK] {os.path.basename(src)} -> {name}")
+                ok += 1
     finally:
         if word is not None:
             try:
@@ -326,7 +489,7 @@ def core_word2pdf(files, outdir, log):
             except Exception:
                 pass
         pythoncom.CoUninitialize()
-    log(f"完成：{ok}/{len(files)} 个成功")
+    log(f"完成：{ok}/{processed} 个成功")
     return ok
 
 
@@ -420,25 +583,41 @@ def _ocr_one(src, out, wc, log):
     return total
 
 
-def core_ocr(files, rules, outdir, log):
+def core_ocr(files, rules, outdir, log, job=None):
     """OCR scanned PDFs into double-layer (image + invisible text) PDFs,
     using WeChat OCR. Engine is initialized once and reused."""
     global _wcocr, _wcocr_ready
     os.makedirs(outdir, exist_ok=True)
     ok = 0
+    processed = 0
     wc = None
     try:
         wc = _init_wcocr(log)
-        for f in files:
+        for f, cancelled in iter_job(job, files):
+            processed += 1
             name = os.path.splitext(os.path.basename(f))[0] + "_ocr.pdf"
             out = unique_target(outdir, name)
             log(f"正在 OCR：{os.path.basename(f)}")
+            if cancelled:
+                log(f"  [已取消] {os.path.basename(f)}")
+                continue
+            err = None
             try:
-                n = _ocr_one(f, out, wc, log)
-                log(f"  [OK] -> {name}（文字 {n} 行）")
-                ok += 1
+                _ocr_one(f, out, wc, log)
             except Exception as e:
-                log(f"  [失败] {type(e).__name__}: {e}")
+                err = e
+            if job is not None and job.is_cancelled(f):
+                log(f"  [已取消] {os.path.basename(f)}（已中断，不计入结果）")
+                if os.path.exists(out):
+                    try:
+                        os.remove(out)
+                    except Exception:
+                        pass
+            elif err is not None:
+                log(f"  [失败] {type(err).__name__}: {err}")
+            else:
+                log(f"  [OK] -> {name}")
+                ok += 1
     except Exception as e:
         log(f"  [失败] 引擎加载：{type(e).__name__}: {e}")
     finally:
@@ -449,5 +628,5 @@ def core_ocr(files, rules, outdir, log):
                 pass
         _wcocr_ready = False
         _wcocr = None
-    log(f"完成：{ok}/{len(files)} 个成功")
+    log(f"完成：{ok}/{processed} 个成功")
     return ok
