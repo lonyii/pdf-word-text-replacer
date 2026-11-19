@@ -22,6 +22,7 @@ except Exception:
     _DND = False
 
 import office_core as core
+import core_batch
 
 APP_TITLE = "OfficeToolkit  ·  PDF / Word 批量处理工具"
 FONT = ("Microsoft YaHei UI", 10)
@@ -279,6 +280,58 @@ class TabPage(ttk.Frame):
 
 
 # ===========================================================================
+# Batch tab: codes -> Everything -> PDF2Word -> replace -> open output
+# ===========================================================================
+class BatchPage(ttk.Frame):
+    """One-code-per-line input; config is embedded and hidden by default.
+    Right-click the text area offers a hidden 'release config' action."""
+    def __init__(self, master):
+        super().__init__(master, padding=(10, 8))
+        self.output_prefix = "批处理"
+        self.with_rules = False
+        self.files = []          # keeps the common start/queue logic happy
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(1, weight=1)
+
+        frm = ttk.LabelFrame(self, text=" 工程编码（一行一个） ", padding=6)
+        frm.grid(row=0, column=0, sticky="nsew")
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(0, weight=1)
+        frm.columnconfigure(0, weight=1)
+        frm.rowconfigure(1, weight=1)
+        ttk.Label(frm, text="每个编码一行，例如 NC24H020；自动搜索线上资料 PDF 并批量处理。"
+                  ).grid(row=0, column=0, sticky="w", pady=(0, 5))
+        self.code_text = tk.Text(frm, font=FONT, height=8, wrap="none")
+        csb = ttk.Scrollbar(frm, orient="vertical", command=self.code_text.yview)
+        self.code_text.configure(yscrollcommand=csb.set)
+        self.code_text.grid(row=1, column=0, sticky="nsew")
+        csb.grid(row=1, column=1, sticky="ns")
+        self.code_text.bind("<Button-3>", self._show_menu)
+
+    def get_codes(self):
+        return [ln.strip() for ln in self.code_text.get("1.0", "end").splitlines()
+                if ln.strip()]
+
+    def _show_menu(self, event):
+        menu = tk.Menu(self, tearoff=0)
+        menu.add_command(label="释放配置文件（高级）", command=self._release_config)
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
+    def _release_config(self):
+        try:
+            p = core_batch.release_config()
+            self.log(f"配置文件已释放：{p}")
+        except Exception as e:
+            self.log(f"释放配置失败：{type(e).__name__}: {e}")
+
+    def log(self, msg):
+        self.winfo_toplevel().push_log(str(msg))
+
+
+# ===========================================================================
 # Main window
 # ===========================================================================
 class App(TkinterDnD.Tk if _DND else tk.Tk):
@@ -314,20 +367,23 @@ class App(TkinterDnD.Tk if _DND else tk.Tk):
         self.rep = TabPage(nb, (".docx", ".doc"), with_rules=True)
         self.w2p = TabPage(nb, (".docx", ".doc"))
         self.ocr = TabPage(nb, (".pdf",))
+        self.batch = BatchPage(nb)
         self.pdf.output_prefix = "PDF转Word"
         self.rep.output_prefix = "文本替换"
         self.w2p.output_prefix = "Word转PDF"
         self.ocr.output_prefix = "OCR双层PDF"
-        self.pages = [self.pdf, self.rep, self.w2p, self.ocr]
+        self.pages = [self.pdf, self.rep, self.w2p, self.ocr, self.batch]
         # normalize all tasks to (files, rules, outdir, log, job)
         self.tasks = [
             lambda f, r, o, log, job: core.core_pdf2word(f, o, log, job),
             lambda f, r, o, log, job: core.core_replace(f, r, o, log, job),
             lambda f, r, o, log, job: core.core_word2pdf(f, o, log, job),
             lambda f, r, o, log, job: core.core_ocr(f, r, o, log, job),
+            lambda f, r, o, log, job: core_batch.run_batch(f, log),
         ]
         for p, name in zip(self.pages,
-                           (" PDF 转 Word ", " 批量替换文本 ", " Word 转 PDF ", " 扫描件 OCR ")):
+                           (" PDF 转 Word ", " 批量替换文本 ", " Word 转 PDF ",
+                            " 扫描件 OCR ", " 批处理 ")):
             nb.add(p, text=name)
         self.nb = nb
         self.current = self.pdf
@@ -445,11 +501,47 @@ class App(TkinterDnD.Tk if _DND else tk.Tk):
             json.dump(data, fh, ensure_ascii=False)
         os.replace(tmp, self._ocr_task_file)
 
+    # ---------- batch pipeline ----------
+    def _start_batch(self, page):
+        codes = page.get_codes()
+        if not codes:
+            messagebox.showwarning("提示", "请输入工程编码（一行一个）", parent=self)
+            return
+        cfg, external = core_batch.load_config()
+        if not os.path.isfile(core_batch.resolve_es(cfg)):
+            messagebox.showerror("错误",
+                                 "找不到 Everything 命令行工具 es.exe。\n"
+                                 "请在文本框右键「释放配置文件」后编辑 es_exe 路径。",
+                                 parent=self)
+            return
+        self.push_log(f"开始批处理 {len(codes)} 个编码" +
+                      ("（使用外部配置）" if external else ""))
+        self.running = True
+        page.running = True
+        self.job_page = page
+        self.start_btn.configure(state="disabled", text="处理中…")
+        self.progress.start(12)
+
+        def worker(codes, cfg):
+            def op_log(m):
+                self.q.put(("log", str(m)))
+            try:
+                core_batch.run_batch(codes, op_log, cfg)
+            except Exception:
+                self.q.put(("log", "异常：\n" + traceback.format_exc()))
+            finally:
+                self.q.put(("done", None))
+
+        threading.Thread(target=worker, args=(codes, cfg), daemon=True).start()
+
     # ---------- start ----------
     def on_start(self):
         if self.running:
             return
         page = self.current
+        if page is self.batch:
+            self._start_batch(page)
+            return
         if not page.files:
             messagebox.showwarning("提示", "请先添加要处理的文件", parent=self)
             return
