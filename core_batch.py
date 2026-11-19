@@ -78,7 +78,11 @@ def _decode_es(data):
 
 
 def _es_query(es, query, n=30):
-    p = subprocess.run([es, "-n", str(n), query], capture_output=True, timeout=30)
+    # Hide the console window: es.exe is a console app and would flash a black
+    # window on every search when launched from the windowed GUI.
+    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    p = subprocess.run([es, "-n", str(n), query], capture_output=True,
+                       timeout=30, creationflags=flags)
     return [ln.strip() for ln in _decode_es(p.stdout).splitlines() if ln.strip()]
 
 
