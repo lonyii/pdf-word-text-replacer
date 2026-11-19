@@ -2,13 +2,8 @@
 # -*- coding: utf-8 -*-
 """OfficeToolkit - Windows GUI for batch PDF/Word utilities.
 
-Three tabs:
-  1. PDF -> Word (via Acrobat Pro, silent)
-  2. Batch find/replace in Word
-  3. Word -> PDF
-
-All work runs in a background thread; logs are marshalled back to the UI
-through a queue. The user never touches a command line.
+Three tabs share ONE bottom control bar (output + start + log), so content
+can never be pushed off-screen. The user never touches a command line.
 """
 import os
 import sys
@@ -23,149 +18,112 @@ import office_core as core
 APP_TITLE = "OfficeToolkit  ·  PDF / Word 批量处理工具"
 FONT = ("Microsoft YaHei UI", 10)
 FONT_B = ("Microsoft YaHei UI", 10, "bold")
-FONT_TITLE = ("Microsoft YaHei UI", 16, "bold")
+FONT_TITLE = ("Microsoft YaHei UI", 15, "bold")
 
 
-class TabFrame(ttk.Frame):
-    """Base frame holding: file list, output chooser, start button, log."""
-
-    def __init__(self, master, title, file_exts, output_prefix, with_rules=False):
-        super().__init__(master, padding=12)
+# ===========================================================================
+# Tab page: only the parts unique to each function (file list, and rules)
+# ===========================================================================
+class TabPage(ttk.Frame):
+    def __init__(self, master, file_exts, with_rules=False):
+        super().__init__(master, padding=(10, 8))
         self.file_exts = file_exts
-        self.output_prefix = output_prefix
         self.with_rules = with_rules
-        self.files = []            # list of file paths
-        self.rules = []            # list of {find, replace}
-        self.task = None           # callable(op_log) for the current job
-        self.running = False
+        self.files = []
+        self.rules = []
+        self.output_prefix = ""
 
-        # ---- top title ----
-        ttk.Label(self, text=title, font=FONT_B).pack(anchor="w", pady=(0, 8))
+        self.columnconfigure(0, weight=1)
+        row = 0
 
-        # ---- file section ----
-        file_box = ttk.LabelFrame(self, text=" ① 选择文件 / 文件夹 ", padding=8)
-        file_box.pack(fill="both", expand=True, pady=(0, 8))
+        # ---- file list ----
+        frm = ttk.LabelFrame(self, text=" 文件 / 文件夹 ", padding=6)
+        frm.grid(row=row, column=0, sticky="nsew")
+        self.rowconfigure(row, weight=1)
+        row += 1
+        frm.columnconfigure(0, weight=1)
+        frm.rowconfigure(1, weight=1)
 
-        btn_bar = ttk.Frame(file_box)
-        btn_bar.pack(fill="x", pady=(0, 6))
-        ttk.Button(btn_bar, text="添加文件…", command=self.add_files).pack(side="left", padx=(0, 6))
-        ttk.Button(btn_bar, text="添加文件夹…", command=self.add_folder).pack(side="left", padx=(0, 6))
-        ttk.Button(btn_bar, text="清空列表", command=self.clear_files).pack(side="left")
+        bar = ttk.Frame(frm)
+        bar.grid(row=0, column=0, sticky="ew", pady=(0, 5))
+        ttk.Button(bar, text="添加文件", command=self.add_files, width=11).pack(side="left", padx=(0, 5))
+        ttk.Button(bar, text="添加文件夹", command=self.add_folder, width=11).pack(side="left", padx=(0, 5))
+        ttk.Button(bar, text="清空", command=self.clear_files, width=7).pack(side="left")
 
-        list_frame = ttk.Frame(file_box)
-        list_frame.pack(fill="both", expand=True)
-        self.listbox = tk.Listbox(list_frame, font=FONT, selectmode="extended",
-                                  activestyle="dotbox")
-        sb = ttk.Scrollbar(list_frame, orient="vertical", command=self.listbox.yview)
+        lf = ttk.Frame(frm)
+        lf.grid(row=1, column=0, sticky="nsew")
+        lf.columnconfigure(0, weight=1)
+        lf.rowconfigure(0, weight=1)
+        self.listbox = tk.Listbox(lf, font=FONT, selectmode="extended",
+                                  activestyle="dotbox", height=4)
+        sb = ttk.Scrollbar(lf, orient="vertical", command=self.listbox.yview)
         self.listbox.configure(yscrollcommand=sb.set)
-        self.listbox.pack(side="left", fill="both", expand=True)
-        sb.pack(side="right", fill="y")
+        self.listbox.grid(row=0, column=0, sticky="nsew")
+        sb.grid(row=0, column=1, sticky="ns")
 
-        # ---- rules section (replace tab only) ----
+        # ---- rules (replace tab only) ----
         if with_rules:
-            rule_box = ttk.LabelFrame(self, text=" ② 替换规则（查找 → 替换） ", padding=8)
-            rule_box.pack(fill="both", expand=True, pady=(0, 8))
-            rb_top = ttk.Frame(rule_box)
-            rb_top.pack(fill="x", pady=(0, 6))
+            rf = ttk.LabelFrame(self, text=" 替换规则（查找 → 替换为） ", padding=6)
+            rf.grid(row=row, column=0, sticky="nsew", pady=(8, 0))
+            self.rowconfigure(row, weight=1)
+            row += 1
+            rf.columnconfigure(1, weight=1)
+            rf.columnconfigure(3, weight=1)
+
+            ttk.Label(rf, text="查找：").grid(row=0, column=0, sticky="w")
             self.find_var = tk.StringVar()
+            ttk.Entry(rf, textvariable=self.find_var).grid(row=0, column=1, sticky="ew", padx=(2, 8))
+            ttk.Label(rf, text="替换为：").grid(row=0, column=2, sticky="w")
             self.repl_var = tk.StringVar()
-            ttk.Label(rb_top, text="查找：").pack(side="left")
-            self.find_entry = ttk.Entry(rb_top, textvariable=self.find_var, width=24)
-            self.find_entry.pack(side="left", padx=(0, 8))
-            ttk.Label(rb_top, text="替换为：").pack(side="left")
-            self.repl_entry = ttk.Entry(rb_top, textvariable=self.repl_var, width=24)
-            self.repl_entry.pack(side="left", padx=(0, 8))
-            ttk.Button(rb_top, text="添加规则", command=self.add_rule).pack(side="left", padx=(0, 6))
-            ttk.Button(rb_top, text="删除选中", command=self.del_rule).pack(side="left")
-            rf = ttk.Frame(rule_box)
-            rf.pack(fill="both", expand=True)
-            self.rule_tree = ttk.Treeview(rf, columns=("find", "replace"),
-                                          show="headings", height=5)
+            ttk.Entry(rf, textvariable=self.repl_var).grid(row=0, column=3, sticky="ew", padx=(2, 8))
+            ttk.Button(rf, text="+ 添加", command=self.add_rule, width=9).grid(row=0, column=4)
+
+            tf = ttk.Frame(rf)
+            tf.grid(row=1, column=0, columnspan=5, sticky="nsew", pady=(6, 0))
+            tf.columnconfigure(0, weight=1)
+            tf.rowconfigure(0, weight=1)
+            self.rule_tree = ttk.Treeview(tf, columns=("find", "replace"),
+                                          show="headings", height=3)
             self.rule_tree.heading("find", text="查找")
             self.rule_tree.heading("replace", text="替换为")
-            self.rule_tree.column("find", width=260)
-            self.rule_tree.column("replace", width=260)
-            rsb = ttk.Scrollbar(rf, orient="vertical", command=self.rule_tree.yview)
+            self.rule_tree.column("find", width=300, stretch=True)
+            self.rule_tree.column("replace", width=300, stretch=True)
+            rsb = ttk.Scrollbar(tf, orient="vertical", command=self.rule_tree.yview)
             self.rule_tree.configure(yscrollcommand=rsb.set)
-            self.rule_tree.pack(side="left", fill="both", expand=True)
-            rsb.pack(side="right", fill="y")
+            self.rule_tree.grid(row=0, column=0, sticky="nsew")
+            rsb.grid(row=0, column=1, sticky="ns")
+            self.rule_tree.bind("<Delete>", lambda e: self.del_rule())
 
-        # ---- output section ----
-        step = "③" if with_rules else "②"
-        out_box = ttk.LabelFrame(self, text=f" {step} 输出位置 ", padding=8)
-        out_box.pack(fill="x", pady=(0, 8))
-        self.out_mode = tk.StringVar(value="desktop")
-        ttk.Radiobutton(out_box, text="桌面新建文件夹（按时间戳命名）",
-                        variable=self.out_mode, value="desktop",
-                        command=self.toggle_out).pack(anchor="w")
-        row = ttk.Frame(out_box)
-        row.pack(fill="x", pady=(4, 0))
-        ttk.Radiobutton(row, text="自定义文件夹：", variable=self.out_mode,
-                        value="custom", command=self.toggle_out).pack(side="left")
-        self.out_var = tk.StringVar()
-        self.out_entry = ttk.Entry(row, textvariable=self.out_var, state="disabled")
-        self.out_entry.pack(side="left", fill="x", expand=True, padx=(4, 6))
-        self.out_btn = ttk.Button(row, text="浏览…", command=self.pick_out,
-                                  state="disabled")
-        self.out_btn.pack(side="left")
-
-        # ---- start button + progress ----
-        step = "④" if with_rules else "③"
-        action = ttk.Frame(self)
-        action.pack(fill="x", pady=(0, 8))
-        self.start_btn = ttk.Button(action, text=f"{step} 开始处理",
-                                    command=self.on_start)
-        self.start_btn.pack(side="left")
-        self.progress = ttk.Progressbar(action, mode="indeterminate", length=200)
-        self.progress.pack(side="left", padx=(12, 0))
-
-        # ---- log ----
-        log_box = ttk.LabelFrame(self, text=" 处理日志 ", padding=6)
-        log_box.pack(fill="both", expand=True)
-        lf = ttk.Frame(log_box)
-        lf.pack(fill="both", expand=True)
-        self.log_text = tk.Text(lf, height=8, font=("Consolas", 9),
-                                state="disabled", wrap="none")
-        lsb = ttk.Scrollbar(lf, orient="vertical", command=self.log_text.yview)
-        self.log_text.configure(yscrollcommand=lsb.set)
-        self.log_text.pack(side="left", fill="both", expand=True)
-        lsb.pack(side="right", fill="y")
-
-    # ---------- file list ----------
+    # ---------- file helpers ----------
     def add_files(self):
-        ftypes = []
-        for e in self.file_exts:
-            ftypes.append((f"{e} 文件", f"*{e}"))
+        ftypes = [(f"{e} 文件", f"*{e}") for e in self.file_exts]
         ftypes.append(("所有文件", "*.*"))
-        paths = filedialog.askopenfilenames(title="选择文件", filetypes=ftypes)
-        self._append_files(paths)
+        self._append(filedialog.askopenfilenames(title="选择文件", filetypes=ftypes))
 
     def add_folder(self):
         d = filedialog.askdirectory(title="选择文件夹（含子文件夹）")
         if d:
-            self._append_files([d])
+            self._append([d])
 
-    def _append_files(self, paths):
-        added = 0
+    def _append(self, paths):
+        n = 0
         for p in paths:
-            files = core.expand_paths([p], self.file_exts)
-            for f in files:
+            for f in core.expand_paths([p], self.file_exts):
                 if f not in self.files:
                     self.files.append(f)
                     self.listbox.insert("end", f)
-                    added += 1
-        if added:
-            self._log(f"已添加 {added} 个文件（支持格式：{'  '.join(self.file_exts)}）")
+                    n += 1
+        if n:
+            self.log(f"已添加 {n} 个文件")
 
     def clear_files(self):
         self.files.clear()
         self.listbox.delete(0, "end")
-        self._log("已清空文件列表")
+        self.log("已清空文件列表")
 
-    # ---------- rules ----------
+    # ---------- rule helpers ----------
     def add_rule(self):
-        f = self.find_var.get().strip()
-        r = self.repl_var.get()
+        f, r = self.find_var.get().strip(), self.repl_var.get()
         if not f:
             messagebox.showwarning("提示", "请填写要查找的文本", parent=self)
             return
@@ -173,61 +131,155 @@ class TabFrame(ttk.Frame):
         self.rule_tree.insert("", "end", values=(f, r))
         self.find_var.set("")
         self.repl_var.set("")
-        self.find_entry.focus_set()
-        self._log(f"已添加规则：'{f}' → '{r}'")
+        self.log(f"规则：'{f}' → '{r}'")
 
     def del_rule(self):
-        sel = self.rule_tree.selection()
-        if not sel:
-            return
-        for item in sel:
-            idx = self.rule_tree.index(item)
+        for item in self.rule_tree.selection():
+            i = self.rule_tree.index(item)
             self.rule_tree.delete(item)
-            if 0 <= idx < len(self.rules):
-                self.rules.pop(idx)
+            if 0 <= i < len(self.rules):
+                self.rules.pop(i)
 
-    # ---------- output ----------
-    def toggle_out(self):
-        custom = self.out_mode.get() == "custom"
-        self.out_entry.configure(state="normal" if custom else "disabled")
-        self.out_btn.configure(state="normal" if custom else "disabled")
+    def log(self, msg):
+        self.winfo_toplevel().push_log(str(msg))
 
-    def pick_out(self):
+
+# ===========================================================================
+# Main window
+# ===========================================================================
+class App(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title(APP_TITLE)
+        self.geometry("820x620")
+        self.minsize(700, 500)
+        self.q = queue.Queue()
+        self.running = False
+        self.current = None
+
+        try:
+            ttk.Style(self).theme_use("vista")
+        except Exception:
+            pass
+
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(1, weight=1)      # notebook expands
+        # row 2 (bottom bar) fixed height
+
+        # header
+        hd = ttk.Frame(self, padding=(12, 8, 12, 0))
+        hd.grid(row=0, column=0, sticky="ew")
+        ttk.Label(hd, text="OfficeToolkit", font=FONT_TITLE).pack(side="left")
+        ttk.Label(hd, text="   PDF / Word 批量处理  ·  无需命令行",
+                  font=FONT, foreground="#666").pack(side="left", pady=(6, 0))
+
+        # notebook (middle)
+        nb = ttk.Notebook(self)
+        nb.grid(row=1, column=0, sticky="nsew", padx=10, pady=8)
+        self.pdf = TabPage(nb, (".pdf",))
+        self.rep = TabPage(nb, (".docx", ".doc"), with_rules=True)
+        self.w2p = TabPage(nb, (".docx", ".doc"))
+        self.pdf.output_prefix = "PDF转Word"
+        self.rep.output_prefix = "文本替换"
+        self.w2p.output_prefix = "Word转PDF"
+        self.pages = [self.pdf, self.rep, self.w2p]
+        # normalize all tasks to (files, rules, outdir, log)
+        self.tasks = [
+            lambda f, r, o, log: core.core_pdf2word(f, o, log),
+            lambda f, r, o, log: core.core_replace(f, r, o, log),
+            lambda f, r, o, log: core.core_word2pdf(f, o, log),
+        ]
+        for p, name in zip(self.pages, (" PDF 转 Word ", " 批量替换文本 ", " Word 转 PDF ")):
+            nb.add(p, text=name)
+        self.nb = nb
+        self.current = self.pdf
+        nb.bind("<<NotebookTabChanged>>", self._tab_changed)
+
+        # ---- bottom fixed control bar ----
+        bottom = ttk.LabelFrame(self, text=" 输出与执行 ", padding=(10, 6))
+        bottom.grid(row=2, column=0, sticky="ew", padx=10, pady=(0, 6))
+        bottom.columnconfigure(1, weight=1)
+
+        # output row
+        ttk.Label(bottom, text="输出：").grid(row=0, column=0, sticky="w")
+        self.out_mode = tk.StringVar(value="desktop")
+        ttk.Radiobutton(bottom, text="桌面新建文件夹", variable=self.out_mode,
+                        value="desktop", command=self._toggle_out).grid(row=0, column=1, sticky="w")
+        self.out_var = tk.StringVar()
+        self.out_entry = ttk.Entry(bottom, textvariable=self.out_var, state="disabled")
+        self.out_entry.grid(row=0, column=2, sticky="ew", padx=(8, 4))
+        self.out_btn = ttk.Button(bottom, text="浏览…", command=self._pick_out, state="disabled", width=7)
+        self.out_btn.grid(row=0, column=3)
+
+        # action row
+        act = ttk.Frame(bottom)
+        act.grid(row=1, column=0, columnspan=4, sticky="ew", pady=(6, 4))
+        self.start_btn = ttk.Button(act, text="开始处理", command=self.on_start, width=14)
+        self.start_btn.pack(side="left")
+        self.progress = ttk.Progressbar(act, mode="indeterminate", length=140)
+        self.progress.pack(side="left", padx=(10, 0))
+        self.update_btn = ttk.Button(act, text="检查更新", command=self.on_check_update, width=12)
+        self.update_btn.pack(side="left", padx=(8, 0))
+        ttk.Label(act, text="处理前请关闭正在编辑的文件", foreground="#888").pack(side="right")
+
+        # log (fixed, always visible)
+        lf = ttk.Frame(bottom)
+        lf.grid(row=2, column=0, columnspan=4, sticky="ew")
+        lf.columnconfigure(0, weight=1)
+        self.log_text = tk.Text(lf, height=5, font=("Consolas", 9),
+                                state="disabled", wrap="none")
+        lsb = ttk.Scrollbar(lf, orient="vertical", command=self.log_text.yview)
+        self.log_text.configure(yscrollcommand=lsb.set)
+        self.log_text.grid(row=0, column=0, sticky="ew")
+        lsb.grid(row=0, column=1, sticky="ns")
+
+        self.after(100, self._poll)
+
+    # ---------- tab switching ----------
+    def _tab_changed(self, _=None):
+        self.current = self.pages[self.nb.index(self.nb.select())]
+
+    # ---------- shared output helpers ----------
+    def _toggle_out(self):
+        c = self.out_mode.get() == "custom"
+        self.out_entry.configure(state="normal" if c else "disabled")
+        self.out_btn.configure(state="normal" if c else "disabled")
+
+    def _pick_out(self):
         d = filedialog.askdirectory(title="选择输出文件夹")
         if d:
             self.out_var.set(d)
 
-    # ---------- logging ----------
-    def _log(self, msg):
-        self.log_text.configure(state="normal")
-        self.log_text.insert("end", str(msg) + "\n")
-        self.log_text.see("end")
-        self.log_text.configure(state="disabled")
+    def push_log(self, msg):
+        self.q.put(("log", str(msg)))
 
     # ---------- start ----------
     def on_start(self):
         if self.running:
             return
-        if not self.files:
+        page = self.current
+        if not page.files:
             messagebox.showwarning("提示", "请先添加要处理的文件", parent=self)
             return
-        if self.with_rules and not self.rules:
+        if page.with_rules and not page.rules:
             messagebox.showwarning("提示", "请至少添加一条替换规则", parent=self)
             return
         custom = self.out_var.get() if self.out_mode.get() == "custom" else ""
         try:
-            outdir = core.make_output_dir(self.output_prefix, custom)
+            outdir = core.make_output_dir(page.output_prefix, custom)
         except Exception as e:
             messagebox.showerror("错误", f"无法创建输出文件夹：{e}", parent=self)
             return
 
-        self._log(f"开始处理 {len(self.files)} 个文件，输出：{outdir}")
+        idx = self.pages.index(page)
+        task = self.tasks[idx]
+        files, rules = list(page.files), (list(page.rules) if page.with_rules else None)
+
+        self.push_log(f"开始处理 {len(files)} 个文件 → {outdir}")
         self.running = True
+        page.running = True
         self.start_btn.configure(state="disabled", text="处理中…")
         self.progress.start(12)
-
-        files = list(self.files)
-        rules = list(self.rules) if self.with_rules else None
 
         def worker(q, task, files, rules, outdir):
             def op_log(m):
@@ -235,102 +287,94 @@ class TabFrame(ttk.Frame):
             try:
                 task(files, rules, outdir, op_log)
             except Exception:
-                q.put(("log", "发生异常：\n" + traceback.format_exc()))
+                q.put(("log", "异常：\n" + traceback.format_exc()))
             finally:
                 q.put(("done", None))
 
-        # NB: self.master is the Notebook, not the Tk root. The queue lives on
-        # the App root - use winfo_toplevel() to reach it from any widget.
-        app_queue = self.winfo_toplevel().q
-        t = threading.Thread(target=worker,
-                             args=(app_queue, self.task, files, rules, outdir),
-                             daemon=True)
-        t.start()
+        threading.Thread(target=worker,
+                         args=(self.q, task, files, rules, outdir),
+                         daemon=True).start()
 
+    # ---------- LAN update ----------
+    def on_check_update(self):
+        if self.running:
+            messagebox.showinfo("提示", "请先等待当前处理完成", parent=self)
+            return
+        self.update_btn.configure(state="disabled", text="检查中…")
+        self._append_log("正在检查局域网更新…")
 
-class App(tk.Tk):
-    def __init__(self):
-        super().__init__()
-        self.title(APP_TITLE)
-        self.geometry("860x680")
-        self.minsize(760, 560)
-        self.q = queue.Queue()
+        def worker():
+            try:
+                info = core.check_update()
+            except Exception as e:
+                info = {"available": False, "msg": f"检查失败：{type(e).__name__}: {e}"}
+            self.q.put(("update", info))
 
-        style = ttk.Style(self)
-        try:
-            style.theme_use("vista")
-        except Exception:
-            pass
+        threading.Thread(target=worker, daemon=True).start()
 
-        # header
-        header = ttk.Frame(self, padding=(14, 12, 14, 4))
-        header.pack(fill="x")
-        ttk.Label(header, text="OfficeToolkit", font=FONT_TITLE).pack(side="left")
-        ttk.Label(header, text="  批量 PDF / Word 处理  ·  无需命令行",
-                  font=FONT).pack(side="left", pady=(8, 0))
+    def _on_update_result(self, info):
+        self.update_btn.configure(state="normal", text="检查更新")
+        msg = info.get("msg", "")
+        self._append_log(msg)
+        if not info.get("available"):
+            messagebox.showinfo("检查更新", msg, parent=self)
+            return
+        # available -> confirm
+        if not messagebox.askyesno("发现新版本", msg + "\n\n更新需要重启程序，是否现在更新？",
+                                   parent=self):
+            return
+        self.update_btn.configure(state="disabled", text="更新中…")
+        self._append_log("正在下载并安装更新…")
 
-        nb = ttk.Notebook(self)
-        nb.pack(fill="both", expand=True, padx=12, pady=8)
+        def worker():
+            try:
+                core.apply_update()
+                self.q.put(("update_done", None))
+            except Exception as e:
+                self.q.put(("update_err", f"{type(e).__name__}: {e}"))
 
-        self.pdf_tab = TabFrame(nb, "PDF 转 Word（调用 Acrobat Pro）",
-                                (".pdf",), "PDF转Word")
-        self.rep_tab = TabFrame(nb, "批量替换 Word 文本（正文 / 页眉页脚 / 表格 / 文本框）",
-                                (".docx", ".doc"), "文本替换", with_rules=True)
-        self.w2p_tab = TabFrame(nb, "Word 转 PDF",
-                                (".docx", ".doc"), "Word转PDF")
+        threading.Thread(target=worker, daemon=True).start()
 
-        self.pdf_tab.task = self._task_pdf2word
-        self.rep_tab.task = self._task_replace
-        self.w2p_tab.task = self._task_word2pdf
-
-        nb.add(self.pdf_tab, text="  PDF 转 Word  ")
-        nb.add(self.rep_tab, text="  批量替换文本  ")
-        nb.add(self.w2p_tab, text="  Word 转 PDF  ")
-
-        ttk.Label(self, text="提示：处理前请关闭正在编辑的 Word / Acrobat 文件；中文路径与文本均支持。",
-                  font=("Microsoft YaHei UI", 9), foreground="#666").pack(
-                      anchor="w", padx=16, pady=(0, 10))
-
-        self.after(120, self._poll_queue)
-
-    # task adapters: core signatures differ (replace takes rules)
-    def _task_pdf2word(self, files, rules, outdir, log):
-        core.core_pdf2word(files, outdir, log)
-
-    def _task_replace(self, files, rules, outdir, log):
-        core.core_replace(files, rules, outdir, log)
-
-    def _task_word2pdf(self, files, rules, outdir, log):
-        core.core_word2pdf(files, outdir, log)
-
-    def _poll_queue(self):
+    def _poll(self):
         try:
             while True:
                 kind, val = self.q.get_nowait()
                 if kind == "log":
-                    for tab in (self.pdf_tab, self.rep_tab, self.w2p_tab):
-                        if tab.running:
-                            tab._log(val)
-                            break
+                    self.log_text.configure(state="normal")
+                    self.log_text.insert("end", val + "\n")
+                    self.log_text.see("end")
+                    self.log_text.configure(state="disabled")
                 elif kind == "done":
-                    for tab in (self.pdf_tab, self.rep_tab, self.w2p_tab):
-                        if tab.running:
-                            tab.running = False
-                            tab.start_btn.configure(state="normal", text="开始处理")
-                            tab.progress.stop()
-                            tab._log("— 处理结束 —")
-                            break
+                    self.running = False
+                    for p in self.pages:
+                        p.running = False
+                    self.start_btn.configure(state="normal", text="开始处理")
+                    self.progress.stop()
+                    self._append_log("— 处理结束 —")
+                elif kind == "update":
+                    self._on_update_result(val)
+                elif kind == "update_done":
+                    self._append_log("更新已安装，程序即将重启…")
+                    self.destroy()
+                elif kind == "update_err":
+                    self.update_btn.configure(state="normal", text="检查更新")
+                    self._append_log("更新失败：" + val)
+                    messagebox.showerror("更新失败", val, parent=self)
         except queue.Empty:
             pass
-        self.after(120, self._poll_queue)
+        self.after(100, self._poll)
+
+    def _append_log(self, msg):
+        self.log_text.configure(state="normal")
+        self.log_text.insert("end", msg + "\n")
+        self.log_text.see("end")
+        self.log_text.configure(state="disabled")
 
 
 def _selftest():
-    """Hidden mode: run a real PDF->Word conversion, write log to a file.
-    Usage: OfficeToolkit.exe --selftest <pdf> <outdir>"""
     import traceback
     args = sys.argv[2:]
-    pdf = args[0] if len(args) > 0 else r"D:\Documents\桌面\新建文件夹 (8)\NC26E444-b.线上资料.pdf"
+    pdf = args[0] if args else r"D:\Documents\桌面\新建文件夹 (8)\NC26E444-b.线上资料.pdf"
     outdir = args[1] if len(args) > 1 else os.path.join(os.environ.get("TEMP", "C:\\Temp"), "ot_selftest")
     logfile = os.path.join(os.environ.get("TEMP", "C:\\Temp"), "ot_selftest_log.txt")
     lines = []
@@ -342,7 +386,7 @@ def _selftest():
         os.makedirs(outdir, exist_ok=True)
         log("SELFTEST START")
         core.core_pdf2word([pdf], outdir, log)
-        log("SELFTEST DONE files=" + repr(os.listdir(outdir)))
+        log("SELFTEST DONE " + repr(os.listdir(outdir)))
     except Exception:
         log("SELFTEST ERR\n" + traceback.format_exc())
 
@@ -351,8 +395,7 @@ def main():
     if "--selftest" in sys.argv:
         _selftest()
         return
-    app = App()
-    app.mainloop()
+    App().mainloop()
 
 
 if __name__ == "__main__":

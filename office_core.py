@@ -3,8 +3,85 @@
 """Core logic for OfficeToolkit GUI. All long-running functions take a
 ``log(msg)`` callback so the GUI can display progress. No input()/print()."""
 import os
+import sys
 import glob
+import shutil
+import hashlib
+import subprocess
 import datetime
+
+# LAN update source: published release lives on the team share
+SHARE_DIR = r"\\Jsztnas\团队文件\内部应用\OfficeToolkit-PDF-Word工具"
+SHARE_EXE = os.path.join(SHARE_DIR, "OfficeToolkit.exe")
+
+
+def _md5(path, chunk=1024 * 1024):
+    h = hashlib.md5()
+    with open(path, "rb") as f:
+        while True:
+            b = f.read(chunk)
+            if not b:
+                break
+            h.update(b)
+    return h.hexdigest()
+
+
+def local_exe_path():
+    """Path to the running EXE (None when running from source)."""
+    exe = getattr(sys, "frozen", False) and sys.executable or None
+    return exe
+
+
+def check_update():
+    """Compare local EXE with the LAN share. Returns a status dict."""
+    result = {"available": False, "msg": "", "remote_mtime": None}
+    if not os.path.isfile(SHARE_EXE):
+        result["msg"] = "无法访问局域网更新源：\n" + SHARE_EXE
+        return result
+    remote_mtime = os.path.getmtime(SHARE_EXE)
+    result["remote_mtime"] = remote_mtime
+    exe = local_exe_path()
+    if not exe or not os.path.isfile(exe):
+        result["msg"] = "当前不是 EXE 运行模式，无法自更新（请在打包后的程序中检查）"
+        return result
+    try:
+        if _md5(exe) == _md5(SHARE_EXE):
+            result["msg"] = "已是最新版本"
+        else:
+            result["available"] = True
+            result["msg"] = "发现新版本，是否更新？"
+    except Exception as e:
+        result["msg"] = f"检查更新失败：{type(e).__name__}: {e}"
+    return result
+
+
+def apply_update():
+    """Download the share EXE over the local one via a helper batch that runs
+    after this process exits (a running EXE cannot be overwritten in place).
+    Raises on error; returns True when the update has been scheduled.
+    """
+    exe = local_exe_path()
+    if not exe or not os.path.isfile(SHARE_EXE):
+        raise RuntimeError("更新源或本地程序不可用")
+    local_dir = os.path.dirname(exe)
+    new_exe = os.path.join(local_dir, "_ot_update_new.exe")
+    bat = os.path.join(local_dir, "_ot_update.bat")
+    shutil.copy2(SHARE_EXE, new_exe)
+    # GBK encoding for cmd.exe Chinese support; wait for this process to exit,
+    # replace, then relaunch.
+    script = (
+        "@echo off\r\n"
+        "chcp 936 >nul\r\n"
+        "timeout /t 3 /nobreak >nul\r\n"
+        f'move /Y "{new_exe}" "{exe}"\r\n'
+        f'start "" "{exe}"\r\n'
+        f'del "%~f0"\r\n'
+    )
+    with open(bat, "w", encoding="gbk", newline="") as fh:
+        fh.write(script)
+    subprocess.Popen(["cmd", "/c", bat], cwd=local_dir,
+                     creationflags=subprocess.CREATE_NO_WINDOW)
+    return True
 
 
 def desktop_path():
