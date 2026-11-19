@@ -299,19 +299,19 @@ class BatchPage(ttk.Frame):
         left.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
         left.columnconfigure(0, weight=1)
         left.rowconfigure(1, weight=1)
-        ttk.Label(left, text="每行一个编码，点「搜索导入」将结果加入右侧列表。"
-                  ).grid(row=0, column=0, sticky="w", pady=(0, 5))
+        ttk.Button(left, text="搜索导入", command=self.search_import, width=14
+                   ).grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 5))
         self.code_text = tk.Text(left, font=FONT, height=8, width=16, wrap="none")
         csb = ttk.Scrollbar(left, orient="vertical", command=self.code_text.yview)
         self.code_text.configure(yscrollcommand=csb.set)
         self.code_text.grid(row=1, column=0, sticky="nsew")
         csb.grid(row=1, column=1, sticky="ns")
         self.code_text.bind("<Button-3>", self._show_menu)
-        ttk.Button(left, text="搜索导入", command=self.search_import, width=14
-                   ).grid(row=2, column=0, columnspan=2, sticky="ew", pady=(6, 0))
 
         # ---- right: file list (same interactions as other tabs) ----
         self.file_page = TabPage(self, (".pdf",))
+        # No outer padding: its inner LabelFrame then aligns with the left one.
+        self.file_page.configure(padding=(0, 0))
         self.file_page.grid(row=0, column=1, sticky="nsew")
         self.files = self.file_page.files   # alias for common start/queue logic
 
