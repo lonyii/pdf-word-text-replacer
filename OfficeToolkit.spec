@@ -4,7 +4,7 @@
 a = Analysis(
     ['office_toolkit_gui.py'],
     pathex=[],
-    binaries=[],
+    binaries=[('vendor/wcocr.pyd', '.')],
     datas=[],
     hiddenimports=['clr', 'win32com.client', 'win32com.shell.shell', 'win32com.shell.shellcon'],
     hookspath=[],
