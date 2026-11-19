@@ -14,3 +14,7 @@
 # Python cache
 __pycache__/
 *.pyc
+
+# PyInstaller build output (release EXEs go to the team share, not the repo)
+dist/
+build/
