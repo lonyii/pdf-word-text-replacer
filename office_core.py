@@ -224,14 +224,20 @@ def apply_update():
     shutil.copy2(SHARE_ZIP, zip_local)
     # Expand-Archive -Force overwrites files; PowerShell handles Chinese names
     # and onedir's many subfolders. Wait for this process to exit first.
+    # NOTE: cmd.exe on Chinese Windows defaults to code page 936 (GBK).
+    # Keep the batch file GBK-encoded and do NOT switch code page, otherwise
+    # Chinese folder names in the paths get mangled (UTF-8 bytes read as GBK).
+    # Use %~dp0 (the batch file's own directory) instead of hard-coded paths,
+    # so Chinese folder names never need to be encoded inside the .bat file.
     script = (
         "@echo off\r\n"
-        "chcp 65001 >nul\r\n"
         "timeout /t 3 /nobreak >nul\r\n"
-        f'powershell -NoProfile -Command "Expand-Archive -LiteralPath \'{zip_local}\' -DestinationPath \'{local_dir}\' -Force"\r\n'
-        f'del /F /Q "{zip_local}"\r\n'
-        f'start "" "{exe}"\r\n'
-        f'del "%~f0"\r\n'
+        "powershell -NoProfile -Command "
+        "\"Expand-Archive -LiteralPath (Join-Path $pwd '_ot_update.zip') "
+        "-DestinationPath $pwd -Force\"\r\n"
+        'del /F /Q "%~dp0_ot_update.zip"\r\n'
+        'start "" "%~dp0OfficeToolkit.exe"\r\n'
+        'del "%~f0"\r\n'
     )
     with open(bat, "w", encoding="gbk", newline="") as fh:
         fh.write(script)
@@ -352,6 +358,60 @@ def _acrobat_convert(pdf, out):
                     pass
 
 
+def fix_docx_header_overlap(docx_path):
+    """Fix two Acrobat-export issues in converted DOCX:
+    1) Large headings sit at the same vertical position as floating header
+       objects (logo / form number), so Word clips their top. Add space-before.
+    2) Tiny page margins (< 20pt) make Word warn "margins are very small"
+       on open/print. Raise them to a safe minimum.
+    """
+    from docx import Document
+    from docx.shared import Pt
+    doc = Document(docx_path)
+
+    # --- raise too-small margins to avoid Word's "margins very small" prompt
+    min_margin = Pt(20)
+    for sec in doc.sections:
+        for attr in ("top_margin", "bottom_margin", "left_margin", "right_margin"):
+            v = getattr(sec, attr)
+            if v is not None and v < min_margin:
+                setattr(sec, attr, min_margin)
+
+    def eff_size(p):
+        szs = [r.font.size.pt for r in p.runs if r.font.size is not None]
+        if szs:
+            return max(szs)
+        try:
+            if p.style.font.size is not None:
+                return p.style.font.size.pt
+        except Exception:
+            pass
+        return None
+
+    def iter_paras(d):
+        for p in d.paragraphs:
+            yield p
+        for t in d.tables:
+            for row in t.rows:
+                for c in row.cells:
+                    for p in c.paragraphs:
+                        yield p
+
+    n = 0
+    for p in iter_paras(doc):
+        if not p.text.strip():
+            continue
+        if p.paragraph_format.space_before is not None:
+            continue
+        sz = eff_size(p)
+        if sz is not None and sz >= 16:
+            p.paragraph_format.space_before = Pt(10)
+            n += 1
+    if n:
+        doc.save(docx_path)
+    return n
+
+
 def core_pdf2word(files, outdir, log, job=None):
     # .NET/COM calls from a worker thread need an initialized COM apartment.
     import pythoncom
@@ -384,6 +444,10 @@ def core_pdf2word(files, outdir, log, job=None):
             elif isinstance(result, Exception):
                 log(f"  [失败] {type(result).__name__}: {result}")
             elif result:
+                try:
+                    fix_docx_header_overlap(out)
+                except Exception:
+                    pass
                 log(f"  [OK] -> {name}")
                 ok += 1
             else:

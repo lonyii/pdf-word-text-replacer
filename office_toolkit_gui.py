@@ -283,34 +283,69 @@ class TabPage(ttk.Frame):
 # Batch tab: codes -> Everything -> PDF2Word -> replace -> open output
 # ===========================================================================
 class BatchPage(ttk.Frame):
-    """One-code-per-line input; config is embedded and hidden by default.
-    Right-click the text area offers a hidden 'release config' action."""
+    """Left: code input + search-import button. Right: file list (reuses
+    TabPage's list with drag/drop, paste, context menu, Delete). Config is
+    embedded and hidden; right-click the code box to release it."""
     def __init__(self, master):
         super().__init__(master, padding=(10, 8))
         self.output_prefix = "批处理"
         self.with_rules = False
-        self.files = []          # keeps the common start/queue logic happy
-        self.columnconfigure(0, weight=1)
-        self.rowconfigure(1, weight=1)
-
-        frm = ttk.LabelFrame(self, text=" 工程编码（一行一个） ", padding=6)
-        frm.grid(row=0, column=0, sticky="nsew")
-        self.columnconfigure(0, weight=1)
+        self.columnconfigure(0, weight=0)
+        self.columnconfigure(1, weight=1)
         self.rowconfigure(0, weight=1)
-        frm.columnconfigure(0, weight=1)
-        frm.rowconfigure(1, weight=1)
-        ttk.Label(frm, text="每个编码一行，例如 NC24H020；自动搜索线上资料 PDF 并批量处理。"
+
+        # ---- left: codes + search/import button ----
+        left = ttk.LabelFrame(self, text=" 工程编码（一行一个） ", padding=6)
+        left.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
+        left.columnconfigure(0, weight=1)
+        left.rowconfigure(1, weight=1)
+        ttk.Label(left, text="每行一个编码，点「搜索导入」将结果加入右侧列表。"
                   ).grid(row=0, column=0, sticky="w", pady=(0, 5))
-        self.code_text = tk.Text(frm, font=FONT, height=8, wrap="none")
-        csb = ttk.Scrollbar(frm, orient="vertical", command=self.code_text.yview)
+        self.code_text = tk.Text(left, font=FONT, height=8, width=16, wrap="none")
+        csb = ttk.Scrollbar(left, orient="vertical", command=self.code_text.yview)
         self.code_text.configure(yscrollcommand=csb.set)
         self.code_text.grid(row=1, column=0, sticky="nsew")
         csb.grid(row=1, column=1, sticky="ns")
         self.code_text.bind("<Button-3>", self._show_menu)
+        ttk.Button(left, text="搜索导入", command=self.search_import, width=14
+                   ).grid(row=2, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+
+        # ---- right: file list (same interactions as other tabs) ----
+        self.file_page = TabPage(self, (".pdf",))
+        self.file_page.grid(row=0, column=1, sticky="nsew")
+        self.files = self.file_page.files   # alias for common start/queue logic
 
     def get_codes(self):
         return [ln.strip() for ln in self.code_text.get("1.0", "end").splitlines()
                 if ln.strip()]
+
+    def search_import(self, _=None):
+        codes = self.get_codes()
+        if not codes:
+            messagebox.showwarning("提示", "请先输入工程编码（一行一个）", parent=self)
+            return
+        cfg, _ = core_batch.load_config()
+        if not os.path.isfile(core_batch.resolve_es(cfg)):
+            messagebox.showerror("错误", "找不到 Everything 命令行工具 es.exe", parent=self)
+            return
+        app = self.winfo_toplevel()
+        app.push_log(f"正在搜索 {len(codes)} 个编码…")
+
+        def worker():
+            added = []
+            try:
+                for code in codes:
+                    try:
+                        pdf = core_batch.search_code(code, cfg, app.push_log)
+                    except Exception as e:
+                        app.push_log(f"  [{code}] 搜索异常：{e}")
+                        continue
+                    if pdf:
+                        added.append(pdf)
+            finally:
+                app.q.put(("batch_import", added))
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def _show_menu(self, event):
         menu = tk.Menu(self, tearoff=0)
@@ -331,9 +366,6 @@ class BatchPage(ttk.Frame):
         self.winfo_toplevel().push_log(str(msg))
 
 
-# ===========================================================================
-# Main window
-# ===========================================================================
 class App(TkinterDnD.Tk if _DND else tk.Tk):
     def __init__(self):
         super().__init__()
@@ -503,18 +535,14 @@ class App(TkinterDnD.Tk if _DND else tk.Tk):
 
     # ---------- batch pipeline ----------
     def _start_batch(self, page):
-        codes = page.get_codes()
-        if not codes:
-            messagebox.showwarning("提示", "请输入工程编码（一行一个）", parent=self)
+        files = list(page.file_page.files)
+        if not files:
+            messagebox.showwarning("提示",
+                                   "请先点「搜索导入」导入文件，或向右侧列表添加 PDF",
+                                   parent=self)
             return
         cfg, external = core_batch.load_config()
-        if not os.path.isfile(core_batch.resolve_es(cfg)):
-            messagebox.showerror("错误",
-                                 "找不到 Everything 命令行工具 es.exe。\n"
-                                 "请在文本框右键「释放配置文件」后编辑 es_exe 路径。",
-                                 parent=self)
-            return
-        self.push_log(f"开始批处理 {len(codes)} 个编码" +
+        self.push_log(f"开始批处理 {len(files)} 个文件" +
                       ("（使用外部配置）" if external else ""))
         self.running = True
         page.running = True
@@ -522,17 +550,17 @@ class App(TkinterDnD.Tk if _DND else tk.Tk):
         self.start_btn.configure(state="disabled", text="处理中…")
         self.progress.start(12)
 
-        def worker(codes, cfg):
+        def worker(files, cfg):
             def op_log(m):
                 self.q.put(("log", str(m)))
             try:
-                core_batch.run_batch(codes, op_log, cfg)
+                core_batch.run_batch_files(files, op_log, cfg)
             except Exception:
                 self.q.put(("log", "异常：\n" + traceback.format_exc()))
             finally:
                 self.q.put(("done", None))
 
-        threading.Thread(target=worker, args=(codes, cfg), daemon=True).start()
+        threading.Thread(target=worker, args=(files, cfg), daemon=True).start()
 
     # ---------- start ----------
     def on_start(self):
@@ -678,6 +706,9 @@ class App(TkinterDnD.Tk if _DND else tk.Tk):
                     self.log_text.insert("end", val + "\n")
                     self.log_text.see("end")
                     self.log_text.configure(state="disabled")
+                elif kind == "batch_import":
+                    self.batch.file_page._append(val or [])
+                    self._append_log(f"搜索导入完成：新增 {len(val or [])} 个文件")
                 elif kind == "done":
                     self.running = False
                     self.job = None
